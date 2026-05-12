@@ -538,7 +538,8 @@ async def fetch_address_txs(session: aiohttp.ClientSession, address: str) -> lis
     Query BlockCypher API for transactions of a given address.
     Uses BlockCypher instead of insight.dash.org to avoid 403 errors.
     """
-    url = f"{BLOCKCYPHER_BASE}/addrs/{address}/full?limit=10"
+    url = f"{BLOCKCYPHER_BASE}/addrs/{address}/full?limit=10&token=bc3a12c3cb5f45fd81a805f1ec68297c"
+
     try:
         async with session.get(url, timeout=aiohttp.ClientTimeout(total=15)) as resp:
             if resp.status == 429:
