@@ -34,7 +34,7 @@ from telegram.ext import (
 
 # ─────────────────────────── CONFIGURATION ────────────────────────────────────
 
-BOT_TOKEN = "8555649605:AAFGw0uEClBfB0IstQN_FBySRw8INHp7MnM"  # Replace with your actual token
+BOT_TOKEN = "8555649605:AAEyxnZW6swghyKDeqPFHWOZE8jC3kPysdg"  # Replace with your actual token
 DATABASE_PATH = "dash_bot.db"
 BLOCKCYPHER_BASE = "https://api.blockcypher.com/v1/dash/main"
 POLLING_INTERVAL = 60  # seconds between blockchain checks
