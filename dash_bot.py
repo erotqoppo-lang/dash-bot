@@ -1,8 +1,8 @@
-"""
+“””
 Production-ready Telegram Bot for DASH Address Tracking
 Requirements: python-telegram-bot>=20.0, aiohttp, aiosqlite
-Install: pip install "python-telegram-bot>=20.0" aiohttp aiosqlite
-"""
+Install: pip install “python-telegram-bot>=20.0” aiohttp aiosqlite
+“””
 
 import asyncio
 import logging
