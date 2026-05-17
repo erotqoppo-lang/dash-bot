@@ -178,7 +178,7 @@ async def get_pool() -> asyncpg.Pool:
 
 async def init_db() -> None:
     global _pool
-    _pool = await asyncpg.create_pool(DATABASE_URL, min_size=1, max_size=5)
+    _pool = await asyncpg.create_pool(DATABASE_URL, min_size=1, max_size=5, ssl="require")
     async with _pool.acquire() as conn:
         await conn.execute("""
             CREATE TABLE IF NOT EXISTS watched_addresses (
