@@ -1,18 +1,19 @@
 """
 Production-ready Telegram Bot for DASH Address Tracking
-Requirements: python-telegram-bot>=20.0, aiohttp, aiosqlite
-Install: pip install "python-telegram-bot>=20.0" aiohttp aiosqlite
+Requirements: python-telegram-bot>=20.0, aiohttp, asyncpg
+Install: pip install "python-telegram-bot>=20.0" aiohttp asyncpg
 """
 
 import asyncio
 import logging
+import os
 import re
 import time
 from datetime import datetime, timezone
 from typing import Optional
 
 import aiohttp
-import aiosqlite
+import asyncpg
 from telegram import (
     Bot,
     CallbackQuery,
@@ -34,9 +35,10 @@ from telegram.ext import (
 
 # ─────────────────────────── CONFIGURATION ────────────────────────────────────
 
-BOT_TOKEN = "8555649605:AAEyxnZW6swghyKDeqPFHWOZE8jC3kPysdg"  # Replace with your actual token
-DATABASE_PATH = "dash_bot.db"
+BOT_TOKEN = os.environ.get("BOT_TOKEN", "YOUR_BOT_TOKEN_HERE")
+DATABASE_URL = os.environ.get("DATABASE_URL", "")  # Set via Railway environment variable
 BLOCKCYPHER_BASE = "https://api.blockcypher.com/v1/dash/main"
+BLOCKCYPHER_TOKEN = os.environ.get("BLOCKCYPHER_TOKEN", "")
 POLLING_INTERVAL = 60  # seconds between blockchain checks
 PRICE_CACHE_TTL = 120  # seconds to cache DASH/USD price
 
@@ -111,7 +113,7 @@ TEXTS = {
         "delete_done": "✅ Address deleted:\n<code>{address}</code>",
         "delete_no_addresses": "📭 No addresses to delete.",
         "deposit_notify": (
-            "💰 <b>Incoming DASH Transaction!</b>\n\n"
+            "💰 <b>Incoming DASH Transaction!</b>{unconfirmed_badge}\n\n"
             "📋 Receipt #{receipt_number}\n"
             "🕐 Time: <b>{timestamp}</b>\n"
             "📤 From: {senders_text}\n"
@@ -146,7 +148,7 @@ TEXTS = {
         "delete_done": "✅ Հասցեն ջնջված է:\n<code>{address}</code>",
         "delete_no_addresses": "📭 Ջնջելու հասցե չկա:",
         "deposit_notify": (
-            "💰 <b>Մուտքային DASH Գործարք!</b>\n\n"
+            "💰 <b>Մուտքային DASH Գործարք!</b>{unconfirmed_badge}\n\n"
             "📋 Անդորրագիր #{receipt_number}\n"
             "🕐 Ժամը: <b>{timestamp}</b>\n"
             "📤 Ուղարկողը: {senders_text}\n"
@@ -161,131 +163,139 @@ TEXTS = {
 # ─────────────────────────── DATABASE ─────────────────────────────────────────
 
 
+# ─────────────────────────── DATABASE ─────────────────────────────────────────
+
+# Global connection pool — created once in main()
+_pool: Optional[asyncpg.Pool] = None
+
+
+async def get_pool() -> asyncpg.Pool:
+    global _pool
+    if _pool is None:
+        raise RuntimeError("Database pool not initialised")
+    return _pool
+
+
 async def init_db() -> None:
-    async with aiosqlite.connect(DATABASE_PATH) as db:
-        await db.executescript(
-            """
+    global _pool
+    _pool = await asyncpg.create_pool(DATABASE_URL, min_size=1, max_size=5)
+    async with _pool.acquire() as conn:
+        await conn.execute("""
             CREATE TABLE IF NOT EXISTS watched_addresses (
-                id          INTEGER PRIMARY KEY AUTOINCREMENT,
-                user_id     INTEGER NOT NULL,
-                address     TEXT    NOT NULL,
-                added_at    INTEGER NOT NULL,
+                id          SERIAL PRIMARY KEY,
+                user_id     BIGINT NOT NULL,
+                address     TEXT   NOT NULL,
+                added_at    BIGINT NOT NULL,
                 UNIQUE(user_id, address)
             );
             CREATE TABLE IF NOT EXISTS user_settings (
-                user_id     INTEGER PRIMARY KEY,
+                user_id     BIGINT PRIMARY KEY,
                 language    TEXT NOT NULL DEFAULT 'en'
             );
             CREATE TABLE IF NOT EXISTS user_receipt_counter (
-                user_id     INTEGER PRIMARY KEY,
+                user_id     BIGINT PRIMARY KEY,
                 counter     INTEGER NOT NULL DEFAULT 0
             );
             CREATE TABLE IF NOT EXISTS seen_transactions (
-                txid        TEXT    NOT NULL,
-                address     TEXT    NOT NULL,
+                txid        TEXT NOT NULL,
+                address     TEXT NOT NULL,
                 PRIMARY KEY (txid, address)
             );
-            """
-        )
-        await db.commit()
-    logger.info("Database initialised at %s", DATABASE_PATH)
+        """)
+    logger.info("PostgreSQL database initialised")
 
 
 async def get_user_language(user_id: int) -> str:
-    async with aiosqlite.connect(DATABASE_PATH) as db:
-        async with db.execute(
-            "SELECT language FROM user_settings WHERE user_id = ?", (user_id,)
-        ) as cursor:
-            row = await cursor.fetchone()
-            return row[0] if row else "en"
+    pool = await get_pool()
+    async with pool.acquire() as conn:
+        row = await conn.fetchrow(
+            "SELECT language FROM user_settings WHERE user_id = $1", user_id
+        )
+        return row["language"] if row else "en"
 
 
 async def set_user_language(user_id: int, lang: str) -> None:
-    async with aiosqlite.connect(DATABASE_PATH) as db:
-        await db.execute(
-            "INSERT INTO user_settings (user_id, language) VALUES (?, ?) "
-            "ON CONFLICT(user_id) DO UPDATE SET language = excluded.language",
-            (user_id, lang),
+    pool = await get_pool()
+    async with pool.acquire() as conn:
+        await conn.execute(
+            "INSERT INTO user_settings (user_id, language) VALUES ($1, $2) "
+            "ON CONFLICT(user_id) DO UPDATE SET language = EXCLUDED.language",
+            user_id, lang,
         )
-        await db.commit()
 
 
 async def get_next_receipt_number(user_id: int) -> int:
     """Atomically increment and return the per-user receipt counter."""
-    async with aiosqlite.connect(DATABASE_PATH) as db:
-        await db.execute(
-            "INSERT INTO user_receipt_counter (user_id, counter) VALUES (?, 1) "
-            "ON CONFLICT(user_id) DO UPDATE SET counter = counter + 1",
-            (user_id,),
+    pool = await get_pool()
+    async with pool.acquire() as conn:
+        row = await conn.fetchrow(
+            "INSERT INTO user_receipt_counter (user_id, counter) VALUES ($1, 1) "
+            "ON CONFLICT(user_id) DO UPDATE SET counter = user_receipt_counter.counter + 1 "
+            "RETURNING counter",
+            user_id,
         )
-        await db.commit()
-        async with db.execute(
-            "SELECT counter FROM user_receipt_counter WHERE user_id = ?", (user_id,)
-        ) as cursor:
-            row = await cursor.fetchone()
-            return row[0]
+        return row["counter"]
 
 
 async def add_address_db(user_id: int, address: str) -> bool:
-    async with aiosqlite.connect(DATABASE_PATH) as db:
+    pool = await get_pool()
+    async with pool.acquire() as conn:
         try:
-            await db.execute(
-                "INSERT INTO watched_addresses (user_id, address, added_at) VALUES (?, ?, ?)",
-                (user_id, address, int(time.time())),
+            await conn.execute(
+                "INSERT INTO watched_addresses (user_id, address, added_at) VALUES ($1, $2, $3)",
+                user_id, address, int(time.time()),
             )
-            await db.commit()
             return True
-        except aiosqlite.IntegrityError:
+        except asyncpg.UniqueViolationError:
             return False
 
 
 async def delete_address_db(user_id: int, address: str) -> None:
-    async with aiosqlite.connect(DATABASE_PATH) as db:
-        await db.execute(
-            "DELETE FROM watched_addresses WHERE user_id = ? AND address = ?",
-            (user_id, address),
+    pool = await get_pool()
+    async with pool.acquire() as conn:
+        await conn.execute(
+            "DELETE FROM watched_addresses WHERE user_id = $1 AND address = $2",
+            user_id, address,
         )
-        await db.commit()
 
 
 async def get_user_addresses(user_id: int) -> list[str]:
-    async with aiosqlite.connect(DATABASE_PATH) as db:
-        async with db.execute(
-            "SELECT address FROM watched_addresses WHERE user_id = ? ORDER BY added_at",
-            (user_id,),
-        ) as cursor:
-            rows = await cursor.fetchall()
-            return [row[0] for row in rows]
+    pool = await get_pool()
+    async with pool.acquire() as conn:
+        rows = await conn.fetch(
+            "SELECT address FROM watched_addresses WHERE user_id = $1 ORDER BY added_at",
+            user_id,
+        )
+        return [row["address"] for row in rows]
 
 
 async def get_all_watched_addresses() -> dict[str, list[int]]:
-    async with aiosqlite.connect(DATABASE_PATH) as db:
-        async with db.execute(
-            "SELECT address, user_id FROM watched_addresses"
-        ) as cursor:
-            rows = await cursor.fetchall()
+    pool = await get_pool()
+    async with pool.acquire() as conn:
+        rows = await conn.fetch("SELECT address, user_id FROM watched_addresses")
     result: dict[str, list[int]] = {}
-    for address, user_id in rows:
-        result.setdefault(address, []).append(user_id)
+    for row in rows:
+        result.setdefault(row["address"], []).append(row["user_id"])
     return result
 
 
 async def is_tx_seen(txid: str, address: str) -> bool:
-    async with aiosqlite.connect(DATABASE_PATH) as db:
-        async with db.execute(
-            "SELECT 1 FROM seen_transactions WHERE txid = ? AND address = ?",
-            (txid, address),
-        ) as cursor:
-            return await cursor.fetchone() is not None
+    pool = await get_pool()
+    async with pool.acquire() as conn:
+        row = await conn.fetchrow(
+            "SELECT 1 FROM seen_transactions WHERE txid = $1 AND address = $2",
+            txid, address,
+        )
+        return row is not None
 
 
 async def mark_tx_seen(txid: str, address: str) -> None:
-    async with aiosqlite.connect(DATABASE_PATH) as db:
-        await db.execute(
-            "INSERT OR IGNORE INTO seen_transactions (txid, address) VALUES (?, ?)",
-            (txid, address),
+    pool = await get_pool()
+    async with pool.acquire() as conn:
+        await conn.execute(
+            "INSERT INTO seen_transactions (txid, address) VALUES ($1, $2) ON CONFLICT DO NOTHING",
+            txid, address,
         )
-        await db.commit()
 
 
 # ─────────────────────────── HELPERS ──────────────────────────────────────────
@@ -484,6 +494,7 @@ async def notify_deposit(
     price_usd: Optional[float] = None,
     tx_time: Optional[int] = None,
     senders: Optional[list[str]] = None,
+    is_unconfirmed: bool = False,
 ) -> None:
     receipt_number = await get_next_receipt_number(user_id)
     lang = await get_user_language(user_id)
@@ -500,6 +511,9 @@ async def notify_deposit(
     txid_short = txid[:8]
     txid_tail = txid[-8:]
 
+    # Badge shown next to title for unconfirmed mempool transactions
+    unconfirmed_badge = "  <i>(unconfirmed)</i>" if is_unconfirmed else ""
+
     if senders:
         senders_text = f"<code>{senders[0]}</code>" if len(senders) == 1 else \
             "\n" + "\n".join(f"<code>{s}</code>" for s in senders)
@@ -510,6 +524,7 @@ async def notify_deposit(
         lang, "deposit_notify",
         receipt_number=receipt_number,
         timestamp=timestamp,
+        unconfirmed_badge=unconfirmed_badge,
         senders_text=senders_text,
         address=address,
         amount_usd=amount_usd,
@@ -523,8 +538,8 @@ async def notify_deposit(
     try:
         await bot.send_message(chat_id=user_id, text=text, parse_mode=ParseMode.HTML)
         logger.info(
-            "Notified user %d | Receipt #%d | %s DASH ≈ %s | %s | %s",
-            user_id, receipt_number, amount_dash, amount_usd, timestamp, txid,
+            "Notified user %d | Receipt #%d | %s DASH ≈ %s | %s | unconfirmed=%s | %s",
+            user_id, receipt_number, amount_dash, amount_usd, timestamp, is_unconfirmed, txid,
         )
     except TelegramError as exc:
         logger.error("Failed to notify user %d: %s", user_id, exc)
@@ -535,32 +550,69 @@ async def notify_deposit(
 
 async def fetch_address_txs(session: aiohttp.ClientSession, address: str) -> list[dict]:
     """
-    Query BlockCypher API for transactions of a given address.
-    Uses BlockCypher instead of insight.dash.org to avoid 403 errors.
+    Query BlockCypher API for BOTH confirmed and unconfirmed transactions.
+    - /full?limit=10          -> last confirmed txs
+    - unconfirmed-txs         -> mempool txs (arrive before block confirmation)
+    Unconfirmed txs are tagged with {"hash": ..., "_unconfirmed": True}.
     """
-    url = f"{BLOCKCYPHER_BASE}/addrs/{address}/full?limit=10&token=bc3a12c3cb5f45fd81a805f1ec68297c"
+    token_param = f"&token={BLOCKCYPHER_TOKEN}" if BLOCKCYPHER_TOKEN else ""
+    results: list[dict] = []
 
+    # ── Confirmed transactions ────────────────────────────────────────────────
+    url_confirmed = f"{BLOCKCYPHER_BASE}/addrs/{address}/full?limit=10{token_param}"
     try:
-        async with session.get(url, timeout=aiohttp.ClientTimeout(total=15)) as resp:
+        async with session.get(url_confirmed, timeout=aiohttp.ClientTimeout(total=15)) as resp:
             if resp.status == 429:
-                logger.warning("BlockCypher rate limit hit for %s, retrying next cycle", address)
+                logger.warning("BlockCypher rate limit hit for %s", address)
                 return []
-            if resp.status != 200:
-                logger.warning("BlockCypher API returned %d for %s", resp.status, address)
-                return []
-            data = await resp.json()
-            return data.get("txs", [])
+            if resp.status == 200:
+                data = await resp.json()
+                results.extend(data.get("txs", []))
     except Exception as exc:
-        logger.error("Error fetching txs for %s: %s", address, exc)
-        return []
+        logger.error("Error fetching confirmed txs for %s: %s", address, exc)
+
+    # ── Unconfirmed (mempool) transactions ────────────────────────────────────
+    url_unconfirmed = f"{BLOCKCYPHER_BASE}/addrs/{address}/full?unconfirmedOnly=true&limit=5{token_param}"
+    try:
+        async with session.get(url_unconfirmed, timeout=aiohttp.ClientTimeout(total=15)) as resp:
+            if resp.status == 200:
+                data = await resp.json()
+                for tx in data.get("txs", []):
+                    # Tag as unconfirmed so we can label it on the receipt
+                    tx["_unconfirmed"] = True
+                    results.append(tx)
+    except Exception as exc:
+        logger.error("Error fetching unconfirmed txs for %s: %s", address, exc)
+
+    return results
 
 
-def extract_tx_info(tx: dict, address: str) -> Optional[tuple[float, list[str]]]:
+def extract_tx_info(tx: dict, address: str) -> Optional[tuple[float, list[str], bool]]:
     """
     Extract received amount and senders from a BlockCypher transaction.
     BlockCypher uses satoshis (1 DASH = 100_000_000 satoshis).
-    Returns (amount_dash, [sender, ...]) or None if address not in outputs.
+
+    ONLY counts outputs where the watched address is a RECIPIENT.
+    If the address only appears in inputs (outgoing tx), returns None.
+
+    Returns (amount_dash, [sender, ...], is_unconfirmed) or None.
     """
+    # ── Check address is NOT the sole sender (filter out outgoing txs) ───────
+    # If address appears in inputs but NOT in outputs -> outgoing, skip it
+    in_inputs = any(
+        address in inp.get("addresses", [])
+        for inp in tx.get("inputs", [])
+    )
+    in_outputs = any(
+        address in out.get("addresses", [])
+        for out in tx.get("outputs", [])
+    )
+
+    if in_inputs and not in_outputs:
+        # Pure outgoing transaction — ignore
+        return None
+
+    # ── Amount received by watched address ───────────────────────────────────
     total_satoshis = 0
     for output in tx.get("outputs", []):
         if address in output.get("addresses", []):
@@ -572,8 +624,24 @@ def extract_tx_info(tx: dict, address: str) -> Optional[tuple[float, list[str]]]
     if total_satoshis == 0:
         return None
 
+    # If address appears in both inputs and outputs it's a change output —
+    # only count the net received amount (outputs - inputs)
+    if in_inputs:
+        spent_satoshis = 0
+        for inp in tx.get("inputs", []):
+            if address in inp.get("addresses", []):
+                try:
+                    spent_satoshis += int(inp.get("output_value", 0))
+                except (TypeError, ValueError):
+                    pass
+        net = total_satoshis - spent_satoshis
+        if net <= 0:
+            return None
+        total_satoshis = net
+
     amount_dash = total_satoshis / 100_000_000
 
+    # ── Sender addresses ─────────────────────────────────────────────────────
     seen: set[str] = set()
     senders: list[str] = []
     for inp in tx.get("inputs", []):
@@ -582,13 +650,15 @@ def extract_tx_info(tx: dict, address: str) -> Optional[tuple[float, list[str]]]
                 seen.add(addr)
                 senders.append(addr)
 
-    return amount_dash, senders
+    is_unconfirmed = bool(tx.get("_unconfirmed", False))
+    return amount_dash, senders, is_unconfirmed
 
 
 async def blockchain_poller(bot: Bot) -> None:
     """
-    Background task: checks all watched addresses for new incoming transactions
-    using BlockCypher API every POLLING_INTERVAL seconds.
+    Background task: checks all watched addresses for new incoming transactions.
+    Notifies immediately for unconfirmed (mempool) txs for fastest alerts,
+    then again once confirmed if needed.
     """
     logger.info("Blockchain poller started (interval: %ds)", POLLING_INTERVAL)
     async with aiohttp.ClientSession() as session:
@@ -608,12 +678,14 @@ async def blockchain_poller(bot: Bot) -> None:
                         info = extract_tx_info(tx, address)
                         if info is None:
                             continue
-                        amount, senders = info
+                        amount, senders, is_unconfirmed = info
                         await mark_tx_seen(txid, address)
 
-                        # Parse BlockCypher ISO timestamp
+                        # Parse timestamp — unconfirmed txs use "received" field
                         tx_time = None
-                        raw_time = tx.get("confirmed") or tx.get("received")
+                        raw_time = tx.get("received") if is_unconfirmed else (
+                            tx.get("confirmed") or tx.get("received")
+                        )
                         if raw_time:
                             try:
                                 dt = datetime.fromisoformat(raw_time.replace("Z", "+00:00"))
@@ -631,8 +703,8 @@ async def blockchain_poller(bot: Bot) -> None:
                                 price_usd=price_usd,
                                 tx_time=tx_time,
                                 senders=senders,
+                                is_unconfirmed=is_unconfirmed,
                             )
-                    # Small delay between addresses to respect rate limits
                     await asyncio.sleep(1)
 
             except Exception as exc:
@@ -692,7 +764,7 @@ async def main() -> None:
             blockchain_poller(application.bot),
             name="blockchain_poller",
         )
-        logger.info("Starting bot polling …")
+        logger.info("Starting bot polling ...")
         await application.start()
         await application.updater.start_polling(
             allowed_updates=Update.ALL_TYPES,
@@ -710,6 +782,9 @@ async def main() -> None:
                 pass
             await application.updater.stop()
             await application.stop()
+            if _pool:
+                await _pool.close()
+                logger.info("Database pool closed.")
 
 
 if __name__ == "__main__":
