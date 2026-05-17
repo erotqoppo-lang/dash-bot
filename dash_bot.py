@@ -39,7 +39,7 @@ BOT_TOKEN = os.environ.get("BOT_TOKEN", "YOUR_BOT_TOKEN_HERE")
 DATABASE_URL = os.environ.get("DATABASE_URL", "")  # Set via Railway environment variable
 BLOCKCYPHER_BASE = "https://api.blockcypher.com/v1/dash/main"
 BLOCKCYPHER_TOKEN = os.environ.get("BLOCKCYPHER_TOKEN", "")
-POLLING_INTERVAL = 60  # seconds between blockchain checks
+POLLING_INTERVAL = 30  # seconds between blockchain checks
 PRICE_CACHE_TTL = 120  # seconds to cache DASH/USD price
 
 logging.basicConfig(
