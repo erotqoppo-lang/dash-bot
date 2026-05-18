@@ -35,11 +35,35 @@ from telegram.ext import (
 
 # ─────────────────────────── CONFIGURATION ────────────────────────────────────
 
+# ─────────────────────────── CONFIGURATION ────────────────────────────────────
+
 BOT_TOKEN = os.environ.get("BOT_TOKEN", "YOUR_BOT_TOKEN_HERE")
-DATABASE_URL = os.environ.get("DATABASE_URL", "")  # Set via Railway environment variable
-BLOCKCYPHER_BASE = "https://api.blockcypher.com/v1/dash/main"
+DATABASE_URL = os.environ.get("DATABASE_URL", "")
 BLOCKCYPHER_TOKEN = os.environ.get("BLOCKCYPHER_TOKEN", "")
-POLLING_INTERVAL = 30  # seconds between blockchain checks
+
+# Multiple blockchain API sources with automatic fallback
+BLOCKCHAIN_APIS = [
+    {
+        "name": "BlockCypher",
+        "base_url": "https://api.blockcypher.com/v1/dash/main",
+        "parse_fn": "parse_blockcypher",
+        "enabled": True,
+    },
+    {
+        "name": "Blockchair",
+        "base_url": "https://blockchair.com/api/dashcore/v1",
+        "parse_fn": "parse_blockchair",
+        "enabled": True,
+    },
+    {
+        "name": "Chainz.cryptoid",
+        "base_url": "https://chainz.cryptoid.info/dash/api.dws",
+        "parse_fn": "parse_chainz",
+        "enabled": True,
+    },
+]
+
+POLLING_INTERVAL = 60  # seconds between blockchain checks
 PRICE_CACHE_TTL = 120  # seconds to cache DASH/USD price
 
 logging.basicConfig(
@@ -47,6 +71,58 @@ logging.basicConfig(
     level=logging.INFO,
 )
 logger = logging.getLogger(__name__)
+
+# ─────────────────────────── BLOCKCHAIN API HEALTH TRACKER ─────────────────────
+
+class APIHealthTracker:
+    """Tracks API health and automatically switches to best performing API."""
+    def __init__(self):
+        self.api_stats: dict[str, dict] = {
+            "BlockCypher": {"success": 0, "fail": 0, "ratelimit": 0, "disabled_until": 0.0},
+            "Blockchair": {"success": 0, "fail": 0, "ratelimit": 0, "disabled_until": 0.0},
+            "Chainz.cryptoid": {"success": 0, "fail": 0, "ratelimit": 0, "disabled_until": 0.0},
+        }
+    
+    def mark_success(self, api_name: str) -> None:
+        if api_name in self.api_stats:
+            self.api_stats[api_name]["success"] += 1
+            logger.info(f"{api_name} success | Stats: {self.api_stats[api_name]}")
+    
+    def mark_ratelimit(self, api_name: str) -> None:
+        if api_name in self.api_stats:
+            self.api_stats[api_name]["ratelimit"] += 1
+            # Disable API for 5 minutes on rate limit
+            self.api_stats[api_name]["disabled_until"] = time.time() + 300
+            logger.warning(f"{api_name} RATE LIMITED — disabled for 5 minutes, switching to fallback")
+    
+    def mark_fail(self, api_name: str) -> None:
+        if api_name in self.api_stats:
+            self.api_stats[api_name]["fail"] += 1
+            logger.warning(f"{api_name} failed")
+    
+    def is_available(self, api_name: str) -> bool:
+        if api_name not in self.api_stats:
+            return True
+        return time.time() > self.api_stats[api_name]["disabled_until"]
+    
+    def get_best_api(self) -> Optional[str]:
+        """Return the best available API by success rate."""
+        available = [(name, self._score(name)) for name in self.api_stats 
+                    if self.is_available(name)]
+        if not available:
+            return None
+        return max(available, key=lambda x: x[1])[0]
+    
+    def _score(self, api_name: str) -> float:
+        if api_name not in self.api_stats:
+            return 0.0
+        stats = self.api_stats[api_name]
+        total = stats["success"] + stats["fail"] + stats["ratelimit"]
+        if total == 0:
+            return 1.0
+        return stats["success"] / total
+
+_api_health = APIHealthTracker()
 
 # ─────────────────────────── PRICE CACHE ──────────────────────────────────────
 
@@ -550,41 +626,124 @@ async def notify_deposit(
 
 async def fetch_address_txs(session: aiohttp.ClientSession, address: str) -> list[dict]:
     """
-    Query BlockCypher API for BOTH confirmed and unconfirmed transactions.
-    - /full?limit=10          -> last confirmed txs
-    - unconfirmed-txs         -> mempool txs (arrive before block confirmation)
-    Unconfirmed txs are tagged with {"hash": ..., "_unconfirmed": True}.
+    Fetch transactions from multiple blockchain APIs with intelligent fallback.
+    - Uses health tracker to determine best API
+    - Automatically switches to fallback on rate limit or error
+    - Recovers blocked APIs after timeout period
     """
-    token_param = f"&token={BLOCKCYPHER_TOKEN}" if BLOCKCYPHER_TOKEN else ""
-    results: list[dict] = []
+    # Try best API first, then fallback to others
+    best_api = _api_health.get_best_api()
+    api_order = []
+    
+    if best_api:
+        api_order.append(best_api)
+        api_order.extend([a["name"] for a in BLOCKCHAIN_APIS if a["name"] != best_api])
+    else:
+        api_order = [a["name"] for a in BLOCKCHAIN_APIS]
 
-    # ── Confirmed transactions ────────────────────────────────────────────────
-    url_confirmed = f"{BLOCKCYPHER_BASE}/addrs/{address}/full?limit=10{token_param}"
-    try:
-        async with session.get(url_confirmed, timeout=aiohttp.ClientTimeout(total=15)) as resp:
-            if resp.status == 429:
-                logger.warning("BlockCypher rate limit hit for %s", address)
-                return []
-            if resp.status == 200:
-                data = await resp.json()
-                results.extend(data.get("txs", []))
-    except Exception as exc:
-        logger.error("Error fetching confirmed txs for %s: %s", address, exc)
+    for api_name in api_order:
+        if not _api_health.is_available(api_name):
+            logger.info(f"Skipping {api_name} (rate limited, will recover soon)")
+            continue
 
-    # ── Unconfirmed (mempool) transactions ────────────────────────────────────
-    url_unconfirmed = f"{BLOCKCYPHER_BASE}/addrs/{address}/full?unconfirmedOnly=true&limit=5{token_param}"
-    try:
-        async with session.get(url_unconfirmed, timeout=aiohttp.ClientTimeout(total=15)) as resp:
-            if resp.status == 200:
-                data = await resp.json()
-                for tx in data.get("txs", []):
-                    # Tag as unconfirmed so we can label it on the receipt
-                    tx["_unconfirmed"] = True
-                    results.append(tx)
-    except Exception as exc:
-        logger.error("Error fetching unconfirmed txs for %s: %s", address, exc)
+        try:
+            if api_name == "BlockCypher":
+                token_param = f"&token={BLOCKCYPHER_TOKEN}" if BLOCKCYPHER_TOKEN else ""
+                url = f"https://api.blockcypher.com/v1/dash/main/addrs/{address}/full?limit=10{token_param}"
+                async with session.get(url, timeout=aiohttp.ClientTimeout(total=15)) as resp:
+                    if resp.status == 429:
+                        _api_health.mark_ratelimit("BlockCypher")
+                        continue
+                    if resp.status != 200:
+                        _api_health.mark_fail("BlockCypher")
+                        logger.warning(f"BlockCypher returned {resp.status}")
+                        continue
+                    data = await resp.json()
+                    txs = data.get("txs", [])
+                    for tx in txs:
+                        tx["_source"] = "BlockCypher"
+                    _api_health.mark_success("BlockCypher")
+                    logger.info(f"✓ BlockCypher: {len(txs)} txs for {address[:16]}...")
+                    return txs
 
-    return results
+            elif api_name == "Blockchair":
+                url = f"https://blockchair.com/api/dashcore/v1/dashboards/address/{address}?limit=10&offset=0"
+                async with session.get(url, timeout=aiohttp.ClientTimeout(total=15)) as resp:
+                    if resp.status == 429:
+                        _api_health.mark_ratelimit("Blockchair")
+                        continue
+                    if resp.status != 200:
+                        _api_health.mark_fail("Blockchair")
+                        logger.warning(f"Blockchair returned {resp.status}")
+                        continue
+                    data = await resp.json()
+                    if data.get("data") and address in data["data"]:
+                        txs = parse_blockchair_txs(data["data"][address], address)
+                        for tx in txs:
+                            tx["_source"] = "Blockchair"
+                        _api_health.mark_success("Blockchair")
+                        logger.info(f"✓ Blockchair: {len(txs)} txs for {address[:16]}...")
+                        return txs
+                    else:
+                        _api_health.mark_fail("Blockchair")
+                        continue
+
+            elif api_name == "Chainz.cryptoid":
+                url = f"https://chainz.cryptoid.info/dash/api.dws?q=addresstxs&a={address}&limit=10"
+                async with session.get(url, timeout=aiohttp.ClientTimeout(total=15)) as resp:
+                    if resp.status != 200:
+                        _api_health.mark_fail("Chainz.cryptoid")
+                        logger.warning(f"Chainz returned {resp.status}")
+                        continue
+                    data = await resp.json()
+                    if isinstance(data, dict) and "error" in data:
+                        _api_health.mark_fail("Chainz.cryptoid")
+                        logger.warning(f"Chainz error: {data['error']}")
+                        continue
+                    txs = parse_chainz_txs(data, address)
+                    for tx in txs:
+                        tx["_source"] = "Chainz"
+                    _api_health.mark_success("Chainz.cryptoid")
+                    logger.info(f"✓ Chainz: {len(txs)} txs for {address[:16]}...")
+                    return txs
+
+        except asyncio.TimeoutError:
+            _api_health.mark_fail(api_name)
+            logger.warning(f"{api_name} timeout, trying next API")
+            continue
+        except Exception as exc:
+            _api_health.mark_fail(api_name)
+            logger.error(f"{api_name} error: {exc}")
+            continue
+
+    logger.error(f"⚠ All APIs failed for {address[:16]}...")
+    return []
+
+
+def parse_chainz_txs(data: list, watched_address: str) -> list[dict]:
+    """
+    Convert Chainz API response format to BlockCypher-like format.
+    Chainz returns: [{"txid": "...", "time": "...", "inputs": [...], "outputs": [...]}, ...]
+    """
+    if not isinstance(data, list):
+        return []
+    
+    converted = []
+    for tx in data:
+        if not isinstance(tx, dict):
+            continue
+        # Normalize format
+        normalized = {
+            "hash": tx.get("txid") or tx.get("hash"),
+            "time": tx.get("time"),  # Unix timestamp string
+            "received": tx.get("received") or tx.get("time"),
+            "inputs": tx.get("inputs", []),
+            "outputs": tx.get("outputs", []),
+            "_source": "Chainz",
+        }
+        if normalized["hash"]:
+            converted.append(normalized)
+    return converted
 
 
 def extract_tx_info(tx: dict, address: str) -> Optional[tuple[float, list[str], bool]]:
