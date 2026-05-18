@@ -63,7 +63,7 @@ BLOCKCHAIN_APIS = [
     },
 ]
 
-POLLING_INTERVAL = 60  # seconds between blockchain checks
+POLLING_INTERVAL = 15  # seconds between blockchain checks
 PRICE_CACHE_TTL = 120  # seconds to cache DASH/USD price
 
 logging.basicConfig(
