@@ -55,12 +55,6 @@ BLOCKCHAIN_APIS = [
         "parse_fn": "parse_chainz",
         "enabled": True,
     },
-    {
-        "name": "Insight",
-        "base_url": "https://insight.dash.org/insight-api",
-        "parse_fn": "parse_insight",
-        "enabled": True,
-    },
 ]
 
 POLLING_INTERVAL = 15  # seconds between blockchain checks (faster notifications)
@@ -81,7 +75,6 @@ class APIHealthTracker:
         self.api_stats: dict[str, dict] = {
             "BlockCypher": {"success": 0, "fail": 0, "ratelimit": 0, "disabled_until": 0.0},
             "Chainz.cryptoid": {"success": 0, "fail": 0, "ratelimit": 0, "disabled_until": 0.0},
-            "Insight": {"success": 0, "fail": 0, "ratelimit": 0, "disabled_until": 0.0},
         }
     
     def mark_success(self, api_name: str) -> None:
@@ -724,62 +717,6 @@ async def fetch_address_txs(session: aiohttp.ClientSession, address: str) -> lis
                     logger.info(f"✓ Chainz: {len(txs)} txs for {address[:16]}...")
                     return txs
 
-            elif api_name == "Insight":
-                url = f"https://insight.dash.org/insight-api/addrs/{address}/txs"
-                async with session.get(url, timeout=aiohttp.ClientTimeout(total=15)) as resp:
-                    if resp.status == 429:
-                        _api_health.mark_ratelimit("Insight")
-                        logger.warning(f"Insight rate limited")
-                        continue
-                    if resp.status == 403:
-                        _api_health.mark_fail("Insight")
-                        logger.warning(f"Insight blocked (403)")
-                        continue
-                    if resp.status != 200:
-                        _api_health.mark_fail("Insight")
-                        logger.warning(f"Insight returned {resp.status}")
-                        continue
-                    try:
-                        data = await resp.json()
-                    except Exception as e:
-                        _api_health.mark_fail("Insight")
-                        logger.warning(f"Insight JSON parse error: {e}")
-                        continue
-                    
-                    if isinstance(data, dict) and "error" in data:
-                        _api_health.mark_fail("Insight")
-                        logger.warning(f"Insight error: {data['error']}")
-                        continue
-                    
-                    # Insight returns array directly: [{"txid": "...", "vin": [...], "vout": [...]}, ...]
-                    txs = data if isinstance(data, list) else []
-                    
-                    if not txs:
-                        logger.info(f"✓ Insight: 0 txs for {address[:16]}...")
-                        _api_health.mark_success("Insight")
-                        return []
-                    
-                    # Convert Insight format to BlockCypher-like format
-                    converted_txs = []
-                    for tx in txs:
-                        if not isinstance(tx, dict):
-                            continue
-                        # Insight uses vin/vout, convert to inputs/outputs
-                        normalized = {
-                            "hash": tx.get("txid"),
-                            "time": tx.get("time"),
-                            "received": tx.get("time"),
-                            "inputs": tx.get("vin", []),
-                            "outputs": tx.get("vout", []),
-                            "_source": "Insight",
-                        }
-                        if normalized["hash"]:
-                            converted_txs.append(normalized)
-                    
-                    _api_health.mark_success("Insight")
-                    logger.info(f"✓ Insight: {len(converted_txs)} txs for {address[:16]}...")
-                    return converted_txs
-
         except asyncio.TimeoutError:
             _api_health.mark_fail(api_name)
             logger.warning(f"{api_name} timeout, trying next API")
@@ -853,44 +790,14 @@ def parse_chainz_txs(data: list, watched_address: str) -> list[dict]:
 
 def extract_tx_info(tx: dict, address: str) -> Optional[tuple[float, list[str], bool]]:
     """
-    Extract received amount and senders from a blockchain transaction.
-    Handles both BlockCypher format (inputs/outputs) and Insight format (vin/vout).
+    Extract received amount and senders from a BlockCypher/Chainz transaction.
+    Uses satoshis (1 DASH = 100_000_000 satoshis).
     Returns (amount_dash, [sender, ...], is_unconfirmed) or None.
     """
-    # Normalize vin/vout to inputs/outputs (Insight uses vin/vout, BlockCypher uses inputs/outputs)
-    inputs = tx.get("inputs") or tx.get("vin", [])
-    outputs = tx.get("outputs") or tx.get("vout", [])
-    
-    # ── Check address is NOT the sole sender ───────────────────────────────
-    in_inputs = any(
-        address in inp.get("addresses", []) or 
-        address == inp.get("addr") or
-        (isinstance(inp.get("scriptPubKey"), dict) and address in inp.get("scriptPubKey", {}).get("addresses", []))
-        for inp in inputs
-    )
-    in_outputs = any(
-        address in out.get("addresses", []) or 
-        address == out.get("address") or
-        (isinstance(out.get("scriptPubKey"), dict) and address in out.get("scriptPubKey", {}).get("addresses", []))
-        for out in outputs
-    )
-
-    if in_inputs and not in_outputs:
-        # Pure outgoing transaction — ignore
-        return None
-
-    # ── Amount received by watched address ───────────────────────────────────
+    # ── Check if address is receiving (in outputs) ───────────────────────────
     total_satoshis = 0
-    for output in outputs:
-        # Check if address is in this output (multiple formats)
-        is_recipient = (
-            address in output.get("addresses", []) or 
-            address == output.get("address") or
-            (isinstance(output.get("scriptPubKey"), dict) and address in output.get("scriptPubKey", {}).get("addresses", []))
-        )
-        
-        if is_recipient:
-            # Get value (BlockCypher uses "value", Insight uses "value" too)
+    for output in tx.get("outputs", []):
+        if address in output.get("addresses", []):
             try:
                 total_satoshis += int(output.get("value", 0))
             except (TypeError, ValueError):
@@ -899,41 +806,13 @@ def extract_tx_info(tx: dict, address: str) -> Optional[tuple[float, list[str], 
     if total_satoshis == 0:
         return None
 
-    # If address appears in both inputs and outputs it's a change output —
-    # only count the net received amount
-    if in_inputs:
-        spent_satoshis = 0
-        for inp in inputs:
-            is_sender = (
-                address in inp.get("addresses", []) or 
-                address == inp.get("addr")
-            )
-            if is_sender:
-                try:
-                    spent_satoshis += int(inp.get("output_value", 0))
-                except (TypeError, ValueError):
-                    pass
-        net = total_satoshis - spent_satoshis
-        if net <= 0:
-            return None
-        total_satoshis = net
-
     amount_dash = total_satoshis / 100_000_000
 
-    # ── Sender addresses ─────────────────────────────────────────────────────
+    # ── Extract sender addresses ─────────────────────────────────────────────
     seen: set[str] = set()
     senders: list[str] = []
-    for inp in inputs:
-        # Extract addresses from input (multiple formats)
-        addrs = []
-        if "addresses" in inp:
-            addrs = inp.get("addresses", [])
-        elif "addr" in inp:
-            addrs = [inp.get("addr")]
-        elif "scriptPubKey" in inp and isinstance(inp["scriptPubKey"], dict):
-            addrs = inp["scriptPubKey"].get("addresses", [])
-        
-        for addr in addrs:
+    for inp in tx.get("inputs", []):
+        for addr in inp.get("addresses", []):
             if addr and addr != address and addr not in seen:
                 seen.add(addr)
                 senders.append(addr)
