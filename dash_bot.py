@@ -44,9 +44,9 @@ BLOCKCYPHER_TOKEN = os.environ.get("BLOCKCYPHER_TOKEN", "")
 # Multiple blockchain API sources with automatic fallback
 BLOCKCHAIN_APIS = [
     {
-        "name": "Blockchain",
-        "base_url": "https://blockchain.info",
-        "parse_fn": "parse_blockchain",
+        "name": "Blockchair",
+        "base_url": "https://blockchair.com/api/dash",
+        "parse_fn": "parse_blockchair",
         "enabled": True,
     },
     {
@@ -73,7 +73,7 @@ class APIHealthTracker:
     """Tracks API health and automatically switches to best performing API."""
     def __init__(self):
         self.api_stats: dict[str, dict] = {
-            "Blockchain": {"success": 0, "fail": 0, "ratelimit": 0, "disabled_until": 0.0},
+            "Blockchair": {"success": 0, "fail": 0, "ratelimit": 0, "disabled_until": 0.0},
             "BlockCypher": {"success": 0, "fail": 0, "ratelimit": 0, "disabled_until": 0.0},
         }
     
@@ -640,68 +640,86 @@ async def fetch_address_txs(session: aiohttp.ClientSession, address: str) -> lis
             continue
 
         try:
-            if api_name == "Blockchain":
-                # Blockchain.info API for DASH (multiaddr endpoint)
-                url = f"https://blockchain.info/q/addresstohash?address={address}"
+            if api_name == "Blockchair":
+                # Blockchair free API for DASH (no token needed)
+                url = f"https://blockchair.com/api/dash/dashboards/address/{address}?limit=100"
                 async with session.get(url, timeout=aiohttp.ClientTimeout(total=15)) as resp:
                     if resp.status == 429:
-                        _api_health.mark_ratelimit("Blockchain")
-                        logger.warning(f"Blockchain rate limited")
+                        _api_health.mark_ratelimit("Blockchair")
+                        logger.warning(f"Blockchair rate limited")
                         continue
                     if resp.status != 200:
-                        _api_health.mark_fail("Blockchain")
-                        logger.warning(f"Blockchain returned {resp.status}")
+                        _api_health.mark_fail("Blockchair")
+                        logger.warning(f"Blockchair returned {resp.status}")
                         continue
                     
                     try:
-                        hash_data = await resp.text()
-                        # Get DASH transactions
-                        url_txs = f"https://chainz.cryptoid.info/dash/api.dws?q=addresstxs&a={address}&limit=20"
-                        async with session.get(url_txs, timeout=aiohttp.ClientTimeout(total=15)) as resp_txs:
-                            if resp_txs.status == 200:
-                                data = await resp_txs.json()
-                                if isinstance(data, list):
-                                    converted = []
-                                    for tx in data:
-                                        if isinstance(tx, dict) and "txid" in tx:
+                        data = await resp.json()
+                        if not data.get("data"):
+                            logger.info(f"✓ Blockchair: 0 txs for {address[:16]}...")
+                            _api_health.mark_success("Blockchair")
+                            return []
+                        
+                        addr_data = data["data"].get(address)
+                        if not addr_data:
+                            logger.info(f"✓ Blockchair: 0 txs for {address[:16]}...")
+                            _api_health.mark_success("Blockchair")
+                            return []
+                        
+                        # Get transactions
+                        txs = addr_data.get("transactions", [])
+                        if not txs:
+                            logger.info(f"✓ Blockchair: 0 txs for {address[:16]}...")
+                            _api_health.mark_success("Blockchair")
+                            return []
+                        
+                        # Fetch full transaction details
+                        converted = []
+                        for tx_hash in txs[:20]:  # Limit to last 20
+                            url_tx = f"https://blockchair.com/api/dash/transactions/{tx_hash}"
+                            try:
+                                async with session.get(url_tx, timeout=aiohttp.ClientTimeout(total=10)) as resp_tx:
+                                    if resp_tx.status == 200:
+                                        tx_data = await resp_tx.json()
+                                        if tx_data.get("data") and tx_hash in tx_data["data"]:
+                                            tx = tx_data["data"][tx_hash]
                                             normalized = {
-                                                "hash": tx.get("txid"),
-                                                "time": tx.get("time"),
-                                                "received": tx.get("time"),
+                                                "hash": tx.get("hash"),
+                                                "time": tx.get("block_time"),
+                                                "received": tx.get("block_time"),
                                                 "confirmations": tx.get("confirmations", 0),
                                                 "inputs": [],
                                                 "outputs": [],
-                                                "_source": "Blockchain",
+                                                "_source": "Blockchair",
                                             }
                                             
                                             # Parse inputs
-                                            for vin in tx.get("vin", []):
-                                                if isinstance(vin, dict):
+                                            for inp in tx.get("inputs", []):
+                                                if isinstance(inp, dict):
                                                     normalized["inputs"].append({
-                                                        "addresses": [vin["addr"]] if "addr" in vin else [],
+                                                        "addresses": [inp["recipient"]] if inp.get("recipient") else [],
                                                     })
                                             
                                             # Parse outputs
-                                            for vout in tx.get("vout", []):
-                                                if isinstance(vout, dict):
-                                                    addresses = []
-                                                    if "addresses" in vout:
-                                                        addresses = vout["addresses"] if isinstance(vout["addresses"], list) else [vout["addresses"]]
-                                                    
+                                            for out in tx.get("outputs", []):
+                                                if isinstance(out, dict):
                                                     normalized["outputs"].append({
-                                                        "addresses": addresses,
-                                                        "value": vout.get("value", 0),
+                                                        "addresses": [out["recipient"]] if out.get("recipient") else [],
+                                                        "value": out.get("value", 0),
                                                     })
                                             
                                             if normalized["hash"]:
                                                 converted.append(normalized)
-                                    
-                                    _api_health.mark_success("Blockchain")
-                                    logger.info(f"✓ Blockchain: {len(converted)} txs for {address[:16]}...")
-                                    return converted
+                            except Exception:
+                                pass  # Skip if single tx fetch fails
+                        
+                        _api_health.mark_success("Blockchair")
+                        logger.info(f"✓ Blockchair: {len(converted)} txs for {address[:16]}...")
+                        return converted
+                    
                     except Exception as e:
-                        _api_health.mark_fail("Blockchain")
-                        logger.warning(f"Blockchain error: {e}")
+                        _api_health.mark_fail("Blockchair")
+                        logger.warning(f"Blockchair error: {e}")
                         continue
 
             elif api_name == "BlockCypher":
