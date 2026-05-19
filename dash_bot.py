@@ -40,15 +40,10 @@ from telegram.ext import (
 BOT_TOKEN = os.environ.get("BOT_TOKEN", "YOUR_BOT_TOKEN_HERE")
 DATABASE_URL = os.environ.get("DATABASE_URL", "")
 BLOCKCYPHER_TOKEN = os.environ.get("BLOCKCYPHER_TOKEN", "")
+BLOCKCYPHER_TOKEN_2 = os.environ.get("BLOCKCYPHER_TOKEN_2", "")  # Second backup token
 
 # Multiple blockchain API sources with automatic fallback
 BLOCKCHAIN_APIS = [
-    {
-        "name": "Chainz",
-        "base_url": "https://chainz.cryptoid.info/dash",
-        "parse_fn": "parse_chainz",
-        "enabled": True,
-    },
     {
         "name": "BlockCypher",
         "base_url": "https://api.blockcypher.com/v1/dash/main",
@@ -73,9 +68,9 @@ class APIHealthTracker:
     """Tracks API health and automatically switches to best performing API."""
     def __init__(self):
         self.api_stats: dict[str, dict] = {
-            "Chainz": {"success": 0, "fail": 0, "ratelimit": 0, "disabled_until": 0.0},
-            "BlockCypher": {"success": 0, "fail": 0, "ratelimit": 0, "disabled_until": 0.0},
+            "BlockCypher": {"success": 0, "fail": 0, "ratelimit": 0, "disabled_until": 0.0, "token_index": 0},
         }
+        self.token_rotation = 0  # Track which token to use
     
     def mark_success(self, api_name: str) -> None:
         if api_name in self.api_stats:
@@ -640,101 +635,38 @@ async def fetch_address_txs(session: aiohttp.ClientSession, address: str) -> lis
             continue
 
         try:
-            if api_name == "Chainz":
-                # Chainz DASH API - simple and reliable
-                url = "https://chainz.cryptoid.info/dash/api.dws"
-                params = {"q": "addresstxs", "a": address, "limit": "50"}
-                async with session.get(url, params=params, timeout=aiohttp.ClientTimeout(total=15)) as resp:
-                    if resp.status == 429:
-                        _api_health.mark_ratelimit("Chainz")
-                        logger.warning(f"Chainz rate limited")
-                        continue
-                    if resp.status != 200:
-                        _api_health.mark_fail("Chainz")
-                        logger.warning(f"Chainz returned {resp.status}")
-                        continue
-                    
-                    try:
-                        data = await resp.json()
-                        if isinstance(data, dict) and "error" in data:
-                            _api_health.mark_fail("Chainz")
-                            logger.warning(f"Chainz error: {data['error']}")
-                            continue
-                        
-                        if not isinstance(data, list):
-                            logger.info(f"✓ Chainz: 0 txs for {address[:16]}...")
-                            _api_health.mark_success("Chainz")
-                            return []
-                        
-                        if len(data) == 0:
-                            logger.info(f"✓ Chainz: 0 txs for {address[:16]}...")
-                            _api_health.mark_success("Chainz")
-                            return []
-                        
-                        # Convert to standard format
-                        converted = []
-                        for tx in data:
-                            if not isinstance(tx, dict):
-                                continue
-                            
-                            normalized = {
-                                "hash": tx.get("txid"),
-                                "time": tx.get("time"),
-                                "received": tx.get("time"),
-                                "confirmations": tx.get("confirmations", 0),
-                                "inputs": [],
-                                "outputs": [],
-                                "_source": "Chainz",
-                            }
-                            
-                            # Parse inputs - Chainz uses "addr"
-                            for vin in tx.get("vin", []):
-                                if isinstance(vin, dict) and "addr" in vin:
-                                    normalized["inputs"].append({
-                                        "addresses": [vin["addr"]],
-                                    })
-                            
-                            # Parse outputs
-                            for vout in tx.get("vout", []):
-                                if isinstance(vout, dict):
-                                    addresses = []
-                                    if "addresses" in vout and isinstance(vout["addresses"], list):
-                                        addresses = vout["addresses"]
-                                    elif "address" in vout:
-                                        addresses = [vout["address"]]
-                                    
-                                    normalized["outputs"].append({
-                                        "addresses": addresses,
-                                        "value": vout.get("value", 0),
-                                    })
-                            
-                            if normalized["hash"]:
-                                converted.append(normalized)
-                        
-                        _api_health.mark_success("Chainz")
-                        logger.info(f"✓ Chainz: {len(converted)} txs for {address[:16]}...")
-                        return converted
-                    
-                    except Exception as e:
-                        _api_health.mark_fail("Chainz")
-                        logger.warning(f"Chainz parse error: {e}")
-                        continue
-
-            elif api_name == "BlockCypher":
-                token_param = f"&token={BLOCKCYPHER_TOKEN}" if BLOCKCYPHER_TOKEN else ""
+            if api_name == "BlockCypher":
+                # Try with token rotation - alternate between 2 tokens
+                tokens = [BLOCKCYPHER_TOKEN, BLOCKCYPHER_TOKEN_2]
+                tokens = [t for t in tokens if t]  # Filter out empty tokens
+                
+                if not tokens:
+                    _api_health.mark_fail("BlockCypher")
+                    logger.warning("No BlockCypher tokens configured")
+                    continue
+                
+                # Rotate between available tokens on each request
+                current_token = tokens[_api_health.token_rotation % len(tokens)]
+                _api_health.token_rotation += 1
+                
+                token_param = f"&token={current_token}"
                 results = []
                 
                 # Fetch confirmed transactions
-                url_confirmed = f"https://api.blockcypher.com/v1/dash/main/addrs/{address}/full?limit=10{token_param}"
-                async with session.get(url_confirmed, timeout=aiohttp.ClientTimeout(total=15)) as resp:
-                    if resp.status == 429:
-                        _api_health.mark_ratelimit("BlockCypher")
-                        continue
-                    if resp.status == 200:
-                        data = await resp.json()
-                        results.extend(data.get("txs", []))
+                url_confirmed = f"https://api.blockcypher.com/v1/dash/main/addrs/{address}/full?limit=20{token_param}"
+                try:
+                    async with session.get(url_confirmed, timeout=aiohttp.ClientTimeout(total=15)) as resp:
+                        if resp.status == 429:
+                            _api_health.mark_ratelimit("BlockCypher")
+                            logger.warning(f"BlockCypher rate limited (token {_api_health.token_rotation % len(tokens)})")
+                            continue
+                        if resp.status == 200:
+                            data = await resp.json()
+                            results.extend(data.get("txs", []))
+                except Exception as e:
+                    logger.warning(f"BlockCypher confirmed fetch error: {e}")
                 
-                # Fetch unconfirmed (mempool) transactions if enabled
+                # Fetch unconfirmed (mempool) transactions
                 if INCLUDE_UNCONFIRMED:
                     url_unconfirmed = f"https://api.blockcypher.com/v1/dash/main/addrs/{address}/full?unconfirmedOnly=true{token_param}"
                     try:
@@ -745,27 +677,26 @@ async def fetch_address_txs(session: aiohttp.ClientSession, address: str) -> lis
                                     tx["_unconfirmed"] = True
                                     results.append(tx)
                     except Exception:
-                        pass
+                        pass  # Continue with confirmed txs if unconfirmed fails
                 
-                if not results:
-                    if resp.status != 200:
-                        _api_health.mark_fail("BlockCypher")
-                        logger.warning(f"BlockCypher returned {resp.status}")
-                        continue
-                
-                for tx in results:
-                    tx["_source"] = "BlockCypher"
-                _api_health.mark_success("BlockCypher")
-                logger.info(f"✓ BlockCypher: {len(results)} txs for {address[:16]}...")
-                return results
+                if results:
+                    for tx in results:
+                        tx["_source"] = "BlockCypher"
+                    _api_health.mark_success("BlockCypher")
+                    logger.info(f"✓ BlockCypher: {len(results)} txs for {address[:16]}... (token {_api_health.token_rotation % len(tokens)})")
+                    return results
+                else:
+                    _api_health.mark_fail("BlockCypher")
+                    logger.warning(f"BlockCypher returned no results")
+                    continue
 
         except asyncio.TimeoutError:
-            _api_health.mark_fail(api_name)
-            logger.warning(f"{api_name} timeout, trying next API")
+            _api_health.mark_fail("BlockCypher")
+            logger.warning(f"BlockCypher timeout")
             continue
         except Exception as exc:
-            _api_health.mark_fail(api_name)
-            logger.error(f"{api_name} error: {exc}")
+            _api_health.mark_fail("BlockCypher")
+            logger.error(f"BlockCypher error: {exc}")
             continue
 
     logger.error(f"⚠ All APIs failed for {address[:16]}...")
