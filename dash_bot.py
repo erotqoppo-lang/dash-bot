@@ -50,15 +50,15 @@ BLOCKCHAIN_APIS = [
         "enabled": True,
     },
     {
-        "name": "Blockchair",
-        "base_url": "https://blockchair.com/api/dashcore/v1",
-        "parse_fn": "parse_blockchair",
-        "enabled": True,
-    },
-    {
         "name": "Chainz.cryptoid",
         "base_url": "https://chainz.cryptoid.info/dash/api.dws",
         "parse_fn": "parse_chainz",
+        "enabled": True,
+    },
+    {
+        "name": "Insight",
+        "base_url": "https://insight.dash.org/insight-api",
+        "parse_fn": "parse_insight",
         "enabled": True,
     },
 ]
@@ -79,8 +79,8 @@ class APIHealthTracker:
     def __init__(self):
         self.api_stats: dict[str, dict] = {
             "BlockCypher": {"success": 0, "fail": 0, "ratelimit": 0, "disabled_until": 0.0},
-            "Blockchair": {"success": 0, "fail": 0, "ratelimit": 0, "disabled_until": 0.0},
             "Chainz.cryptoid": {"success": 0, "fail": 0, "ratelimit": 0, "disabled_until": 0.0},
+            "Insight": {"success": 0, "fail": 0, "ratelimit": 0, "disabled_until": 0.0},
         }
     
     def mark_success(self, api_name: str) -> None:
@@ -666,45 +666,79 @@ async def fetch_address_txs(session: aiohttp.ClientSession, address: str) -> lis
                     logger.info(f"✓ BlockCypher: {len(txs)} txs for {address[:16]}...")
                     return txs
 
-            elif api_name == "Blockchair":
-                url = f"https://blockchair.com/api/dashcore/v1/dashboards/address/{address}?limit=10&offset=0"
-                async with session.get(url, timeout=aiohttp.ClientTimeout(total=15)) as resp:
-                    if resp.status == 429:
-                        _api_health.mark_ratelimit("Blockchair")
-                        continue
-                    if resp.status != 200:
-                        _api_health.mark_fail("Blockchair")
-                        logger.warning(f"Blockchair returned {resp.status}")
-                        continue
-                    data = await resp.json()
-                    if data.get("data") and address in data["data"]:
-                        txs = parse_blockchair_txs(data["data"][address], address)
-                        for tx in txs:
-                            tx["_source"] = "Blockchair"
-                        _api_health.mark_success("Blockchair")
-                        logger.info(f"✓ Blockchair: {len(txs)} txs for {address[:16]}...")
-                        return txs
-                    else:
-                        _api_health.mark_fail("Blockchair")
-                        continue
-
             elif api_name == "Chainz.cryptoid":
-                url = f"https://chainz.cryptoid.info/dash/api.dws?q=addresstxs&a={address}&limit=10"
-                async with session.get(url, timeout=aiohttp.ClientTimeout(total=15)) as resp:
+                # Chainz doesn't require auth but has strict format
+                url = f"https://chainz.cryptoid.info/dash/api.dws"
+                params = {"q": "addresstxs", "a": address, "limit": "10"}
+                async with session.get(url, params=params, timeout=aiohttp.ClientTimeout(total=15)) as resp:
+                    if resp.status == 429:
+                        _api_health.mark_ratelimit("Chainz.cryptoid")
+                        logger.warning(f"Chainz rate limited")
+                        continue
                     if resp.status != 200:
                         _api_health.mark_fail("Chainz.cryptoid")
                         logger.warning(f"Chainz returned {resp.status}")
                         continue
-                    data = await resp.json()
+                    try:
+                        data = await resp.json()
+                    except Exception:
+                        _api_health.mark_fail("Chainz.cryptoid")
+                        logger.warning(f"Chainz JSON parse error")
+                        continue
+                    
                     if isinstance(data, dict) and "error" in data:
                         _api_health.mark_fail("Chainz.cryptoid")
                         logger.warning(f"Chainz error: {data['error']}")
                         continue
+                    if not isinstance(data, list) or len(data) == 0:
+                        # Empty response is OK, just no txs
+                        logger.info(f"✓ Chainz: 0 txs for {address[:16]}...")
+                        _api_health.mark_success("Chainz.cryptoid")
+                        return []
+                    
                     txs = parse_chainz_txs(data, address)
                     for tx in txs:
                         tx["_source"] = "Chainz"
                     _api_health.mark_success("Chainz.cryptoid")
                     logger.info(f"✓ Chainz: {len(txs)} txs for {address[:16]}...")
+                    return txs
+
+            elif api_name == "Insight":
+                url = f"https://insight.dash.org/insight-api/addrs/{address}/txs?limit=10"
+                async with session.get(url, timeout=aiohttp.ClientTimeout(total=15)) as resp:
+                    if resp.status == 429:
+                        _api_health.mark_ratelimit("Insight")
+                        logger.warning(f"Insight rate limited")
+                        continue
+                    if resp.status == 403:
+                        _api_health.mark_fail("Insight")
+                        logger.warning(f"Insight blocked (403)")
+                        continue
+                    if resp.status != 200:
+                        _api_health.mark_fail("Insight")
+                        logger.warning(f"Insight returned {resp.status}")
+                        continue
+                    try:
+                        data = await resp.json()
+                    except Exception:
+                        _api_health.mark_fail("Insight")
+                        logger.warning(f"Insight JSON parse error")
+                        continue
+                    
+                    if isinstance(data, dict) and "error" in data:
+                        _api_health.mark_fail("Insight")
+                        continue
+                    
+                    txs = data.get("transactions", []) if isinstance(data, dict) else (data if isinstance(data, list) else [])
+                    if not txs:
+                        logger.info(f"✓ Insight: 0 txs for {address[:16]}...")
+                        _api_health.mark_success("Insight")
+                        return []
+                    
+                    for tx in txs:
+                        tx["_source"] = "Insight"
+                    _api_health.mark_success("Insight")
+                    logger.info(f"✓ Insight: {len(txs)} txs for {address[:16]}...")
                     return txs
 
         except asyncio.TimeoutError:
@@ -720,11 +754,44 @@ async def fetch_address_txs(session: aiohttp.ClientSession, address: str) -> lis
     return []
 
 
+def parse_blockchair_txs(addr_data: dict, watched_address: str) -> list[dict]:
+    """Convert Blockchair API response to BlockCypher-like format."""
+    converted = []
+    txs = addr_data.get("transactions", [])
+    if not isinstance(txs, list):
+        return []
+    
+    for tx in txs:
+        if not isinstance(tx, dict):
+            continue
+        normalized = {
+            "hash": tx.get("hash"),
+            "time": tx.get("time"),
+            "received": tx.get("time"),
+            "inputs": [],
+            "outputs": [],
+            "_source": "Blockchair",
+        }
+        # Parse inputs/outputs from Blockchair format
+        for inp in tx.get("inputs", []):
+            if isinstance(inp, dict):
+                normalized["inputs"].append({
+                    "addresses": [inp.get("recipient")] if inp.get("recipient") else [],
+                    "output_value": inp.get("value", 0),
+                })
+        for out in tx.get("outputs", []):
+            if isinstance(out, dict):
+                normalized["outputs"].append({
+                    "addresses": [out.get("recipient")] if out.get("recipient") else [],
+                    "value": out.get("value", 0),
+                })
+        if normalized["hash"]:
+            converted.append(normalized)
+    return converted
+
+
 def parse_chainz_txs(data: list, watched_address: str) -> list[dict]:
-    """
-    Convert Chainz API response format to BlockCypher-like format.
-    Chainz returns: [{"txid": "...", "time": "...", "inputs": [...], "outputs": [...]}, ...]
-    """
+    """Convert Chainz API response format to BlockCypher-like format."""
     if not isinstance(data, list):
         return []
     
@@ -732,10 +799,9 @@ def parse_chainz_txs(data: list, watched_address: str) -> list[dict]:
     for tx in data:
         if not isinstance(tx, dict):
             continue
-        # Normalize format
         normalized = {
             "hash": tx.get("txid") or tx.get("hash"),
-            "time": tx.get("time"),  # Unix timestamp string
+            "time": tx.get("time"),
             "received": tx.get("received") or tx.get("time"),
             "inputs": tx.get("inputs", []),
             "outputs": tx.get("outputs", []),
