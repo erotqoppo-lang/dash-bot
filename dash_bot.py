@@ -725,7 +725,7 @@ async def fetch_address_txs(session: aiohttp.ClientSession, address: str) -> lis
                     return txs
 
             elif api_name == "Insight":
-                url = f"https://insight.dash.org/insight-api/addrs/{address}/txs?limit=10"
+                url = f"https://insight.dash.org/insight-api/addrs/{address}/txs"
                 async with session.get(url, timeout=aiohttp.ClientTimeout(total=15)) as resp:
                     if resp.status == 429:
                         _api_health.mark_ratelimit("Insight")
@@ -741,26 +741,44 @@ async def fetch_address_txs(session: aiohttp.ClientSession, address: str) -> lis
                         continue
                     try:
                         data = await resp.json()
-                    except Exception:
+                    except Exception as e:
                         _api_health.mark_fail("Insight")
-                        logger.warning(f"Insight JSON parse error")
+                        logger.warning(f"Insight JSON parse error: {e}")
                         continue
                     
                     if isinstance(data, dict) and "error" in data:
                         _api_health.mark_fail("Insight")
+                        logger.warning(f"Insight error: {data['error']}")
                         continue
                     
-                    txs = data.get("transactions", []) if isinstance(data, dict) else (data if isinstance(data, list) else [])
+                    # Insight returns array directly: [{"txid": "...", "vin": [...], "vout": [...]}, ...]
+                    txs = data if isinstance(data, list) else []
+                    
                     if not txs:
                         logger.info(f"✓ Insight: 0 txs for {address[:16]}...")
                         _api_health.mark_success("Insight")
                         return []
                     
+                    # Convert Insight format to BlockCypher-like format
+                    converted_txs = []
                     for tx in txs:
-                        tx["_source"] = "Insight"
+                        if not isinstance(tx, dict):
+                            continue
+                        # Insight uses vin/vout, convert to inputs/outputs
+                        normalized = {
+                            "hash": tx.get("txid"),
+                            "time": tx.get("time"),
+                            "received": tx.get("time"),
+                            "inputs": tx.get("vin", []),
+                            "outputs": tx.get("vout", []),
+                            "_source": "Insight",
+                        }
+                        if normalized["hash"]:
+                            converted_txs.append(normalized)
+                    
                     _api_health.mark_success("Insight")
-                    logger.info(f"✓ Insight: {len(txs)} txs for {address[:16]}...")
-                    return txs
+                    logger.info(f"✓ Insight: {len(converted_txs)} txs for {address[:16]}...")
+                    return converted_txs
 
         except asyncio.TimeoutError:
             _api_health.mark_fail(api_name)
@@ -835,23 +853,26 @@ def parse_chainz_txs(data: list, watched_address: str) -> list[dict]:
 
 def extract_tx_info(tx: dict, address: str) -> Optional[tuple[float, list[str], bool]]:
     """
-    Extract received amount and senders from a BlockCypher transaction.
-    BlockCypher uses satoshis (1 DASH = 100_000_000 satoshis).
-
-    ONLY counts outputs where the watched address is a RECIPIENT.
-    If the address only appears in inputs (outgoing tx), returns None.
-
+    Extract received amount and senders from a blockchain transaction.
+    Handles both BlockCypher format (inputs/outputs) and Insight format (vin/vout).
     Returns (amount_dash, [sender, ...], is_unconfirmed) or None.
     """
-    # ── Check address is NOT the sole sender (filter out outgoing txs) ───────
-    # If address appears in inputs but NOT in outputs -> outgoing, skip it
+    # Normalize vin/vout to inputs/outputs (Insight uses vin/vout, BlockCypher uses inputs/outputs)
+    inputs = tx.get("inputs") or tx.get("vin", [])
+    outputs = tx.get("outputs") or tx.get("vout", [])
+    
+    # ── Check address is NOT the sole sender ───────────────────────────────
     in_inputs = any(
-        address in inp.get("addresses", [])
-        for inp in tx.get("inputs", [])
+        address in inp.get("addresses", []) or 
+        address == inp.get("addr") or
+        (isinstance(inp.get("scriptPubKey"), dict) and address in inp.get("scriptPubKey", {}).get("addresses", []))
+        for inp in inputs
     )
     in_outputs = any(
-        address in out.get("addresses", [])
-        for out in tx.get("outputs", [])
+        address in out.get("addresses", []) or 
+        address == out.get("address") or
+        (isinstance(out.get("scriptPubKey"), dict) and address in out.get("scriptPubKey", {}).get("addresses", []))
+        for out in outputs
     )
 
     if in_inputs and not in_outputs:
@@ -860,8 +881,16 @@ def extract_tx_info(tx: dict, address: str) -> Optional[tuple[float, list[str], 
 
     # ── Amount received by watched address ───────────────────────────────────
     total_satoshis = 0
-    for output in tx.get("outputs", []):
-        if address in output.get("addresses", []):
+    for output in outputs:
+        # Check if address is in this output (multiple formats)
+        is_recipient = (
+            address in output.get("addresses", []) or 
+            address == output.get("address") or
+            (isinstance(output.get("scriptPubKey"), dict) and address in output.get("scriptPubKey", {}).get("addresses", []))
+        )
+        
+        if is_recipient:
+            # Get value (BlockCypher uses "value", Insight uses "value" too)
             try:
                 total_satoshis += int(output.get("value", 0))
             except (TypeError, ValueError):
@@ -871,11 +900,15 @@ def extract_tx_info(tx: dict, address: str) -> Optional[tuple[float, list[str], 
         return None
 
     # If address appears in both inputs and outputs it's a change output —
-    # only count the net received amount (outputs - inputs)
+    # only count the net received amount
     if in_inputs:
         spent_satoshis = 0
-        for inp in tx.get("inputs", []):
-            if address in inp.get("addresses", []):
+        for inp in inputs:
+            is_sender = (
+                address in inp.get("addresses", []) or 
+                address == inp.get("addr")
+            )
+            if is_sender:
                 try:
                     spent_satoshis += int(inp.get("output_value", 0))
                 except (TypeError, ValueError):
@@ -890,8 +923,17 @@ def extract_tx_info(tx: dict, address: str) -> Optional[tuple[float, list[str], 
     # ── Sender addresses ─────────────────────────────────────────────────────
     seen: set[str] = set()
     senders: list[str] = []
-    for inp in tx.get("inputs", []):
-        for addr in inp.get("addresses", []):
+    for inp in inputs:
+        # Extract addresses from input (multiple formats)
+        addrs = []
+        if "addresses" in inp:
+            addrs = inp.get("addresses", [])
+        elif "addr" in inp:
+            addrs = [inp.get("addr")]
+        elif "scriptPubKey" in inp and isinstance(inp["scriptPubKey"], dict):
+            addrs = inp["scriptPubKey"].get("addresses", [])
+        
+        for addr in addrs:
             if addr and addr != address and addr not in seen:
                 seen.add(addr)
                 senders.append(addr)
