@@ -44,9 +44,9 @@ BLOCKCYPHER_TOKEN = os.environ.get("BLOCKCYPHER_TOKEN", "")
 # Multiple blockchain API sources with automatic fallback
 BLOCKCHAIN_APIS = [
     {
-        "name": "Insight",
-        "base_url": "https://insight.dash.org/insight-api",
-        "parse_fn": "parse_insight",
+        "name": "Blockchain",
+        "base_url": "https://blockchain.info",
+        "parse_fn": "parse_blockchain",
         "enabled": True,
     },
     {
@@ -73,7 +73,7 @@ class APIHealthTracker:
     """Tracks API health and automatically switches to best performing API."""
     def __init__(self):
         self.api_stats: dict[str, dict] = {
-            "Insight": {"success": 0, "fail": 0, "ratelimit": 0, "disabled_until": 0.0},
+            "Blockchain": {"success": 0, "fail": 0, "ratelimit": 0, "disabled_until": 0.0},
             "BlockCypher": {"success": 0, "fail": 0, "ratelimit": 0, "disabled_until": 0.0},
         }
     
@@ -640,78 +640,69 @@ async def fetch_address_txs(session: aiohttp.ClientSession, address: str) -> lis
             continue
 
         try:
-            if api_name == "Insight":
-                url = f"https://insight.dash.org/insight-api/addrs/{address}/txs"
+            if api_name == "Blockchain":
+                # Blockchain.info API for DASH (multiaddr endpoint)
+                url = f"https://blockchain.info/q/addresstohash?address={address}"
                 async with session.get(url, timeout=aiohttp.ClientTimeout(total=15)) as resp:
                     if resp.status == 429:
-                        _api_health.mark_ratelimit("Insight")
-                        logger.warning(f"Insight rate limited")
-                        continue
-                    if resp.status == 403:
-                        _api_health.mark_fail("Insight")
-                        logger.warning(f"Insight blocked (403)")
+                        _api_health.mark_ratelimit("Blockchain")
+                        logger.warning(f"Blockchain rate limited")
                         continue
                     if resp.status != 200:
-                        _api_health.mark_fail("Insight")
-                        logger.warning(f"Insight returned {resp.status}")
+                        _api_health.mark_fail("Blockchain")
+                        logger.warning(f"Blockchain returned {resp.status}")
                         continue
+                    
                     try:
-                        data = await resp.json()
+                        hash_data = await resp.text()
+                        # Get DASH transactions
+                        url_txs = f"https://chainz.cryptoid.info/dash/api.dws?q=addresstxs&a={address}&limit=20"
+                        async with session.get(url_txs, timeout=aiohttp.ClientTimeout(total=15)) as resp_txs:
+                            if resp_txs.status == 200:
+                                data = await resp_txs.json()
+                                if isinstance(data, list):
+                                    converted = []
+                                    for tx in data:
+                                        if isinstance(tx, dict) and "txid" in tx:
+                                            normalized = {
+                                                "hash": tx.get("txid"),
+                                                "time": tx.get("time"),
+                                                "received": tx.get("time"),
+                                                "confirmations": tx.get("confirmations", 0),
+                                                "inputs": [],
+                                                "outputs": [],
+                                                "_source": "Blockchain",
+                                            }
+                                            
+                                            # Parse inputs
+                                            for vin in tx.get("vin", []):
+                                                if isinstance(vin, dict):
+                                                    normalized["inputs"].append({
+                                                        "addresses": [vin["addr"]] if "addr" in vin else [],
+                                                    })
+                                            
+                                            # Parse outputs
+                                            for vout in tx.get("vout", []):
+                                                if isinstance(vout, dict):
+                                                    addresses = []
+                                                    if "addresses" in vout:
+                                                        addresses = vout["addresses"] if isinstance(vout["addresses"], list) else [vout["addresses"]]
+                                                    
+                                                    normalized["outputs"].append({
+                                                        "addresses": addresses,
+                                                        "value": vout.get("value", 0),
+                                                    })
+                                            
+                                            if normalized["hash"]:
+                                                converted.append(normalized)
+                                    
+                                    _api_health.mark_success("Blockchain")
+                                    logger.info(f"✓ Blockchain: {len(converted)} txs for {address[:16]}...")
+                                    return converted
                     except Exception as e:
-                        _api_health.mark_fail("Insight")
-                        logger.warning(f"Insight JSON parse error: {e}")
+                        _api_health.mark_fail("Blockchain")
+                        logger.warning(f"Blockchain error: {e}")
                         continue
-                    
-                    # Insight returns array directly
-                    txs = data if isinstance(data, list) else []
-                    
-                    if not txs:
-                        logger.info(f"✓ Insight: 0 txs for {address[:16]}...")
-                        _api_health.mark_success("Insight")
-                        return []
-                    
-                    # Convert Insight format (vin/vout) to BlockCypher-like
-                    converted = []
-                    for tx in txs:
-                        if not isinstance(tx, dict):
-                            continue
-                        normalized = {
-                            "hash": tx.get("txid"),
-                            "time": tx.get("time"),
-                            "received": tx.get("time"),
-                            "confirmations": tx.get("confirmations", 0),
-                            "inputs": [],
-                            "outputs": [],
-                            "_source": "Insight",
-                        }
-                        
-                        # Parse inputs
-                        for vin in tx.get("vin", []):
-                            if isinstance(vin, dict):
-                                normalized["inputs"].append({
-                                    "addresses": [vin["addr"]] if "addr" in vin else [],
-                                    "address": vin.get("addr"),
-                                })
-                        
-                        # Parse outputs
-                        for vout in tx.get("vout", []):
-                            if isinstance(vout, dict):
-                                addresses = []
-                                if "scriptPubKey" in vout and isinstance(vout["scriptPubKey"], dict):
-                                    addresses = vout["scriptPubKey"].get("addresses", [])
-                                
-                                normalized["outputs"].append({
-                                    "addresses": addresses,
-                                    "address": addresses[0] if addresses else None,
-                                    "value": vout.get("value", 0),
-                                })
-                        
-                        if normalized["hash"]:
-                            converted.append(normalized)
-                    
-                    _api_health.mark_success("Insight")
-                    logger.info(f"✓ Insight: {len(converted)} txs for {address[:16]}...")
-                    return converted
 
             elif api_name == "BlockCypher":
                 token_param = f"&token={BLOCKCYPHER_TOKEN}" if BLOCKCYPHER_TOKEN else ""
