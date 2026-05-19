@@ -50,9 +50,9 @@ BLOCKCHAIN_APIS = [
         "enabled": True,
     },
     {
-        "name": "Bitindex",
-        "base_url": "https://dashsight.bitindex.org/api",
-        "parse_fn": "parse_bitindex",
+        "name": "Chainz",
+        "base_url": "https://chainz.cryptoid.info/dash",
+        "parse_fn": "parse_chainz",
         "enabled": True,
     },
 ]
@@ -74,7 +74,7 @@ class APIHealthTracker:
     def __init__(self):
         self.api_stats: dict[str, dict] = {
             "BlockCypher": {"success": 0, "fail": 0, "ratelimit": 0, "disabled_until": 0.0},
-            "Bitindex": {"success": 0, "fail": 0, "ratelimit": 0, "disabled_until": 0.0},
+            "Chainz": {"success": 0, "fail": 0, "ratelimit": 0, "disabled_until": 0.0},
         }
     
     def mark_success(self, api_name: str) -> None:
@@ -679,42 +679,44 @@ async def fetch_address_txs(session: aiohttp.ClientSession, address: str) -> lis
                 logger.info(f"✓ BlockCypher: {len(results)} txs for {address[:16]}...")
                 return results
 
-            elif api_name == "Bitindex":
-                url = f"https://dashsight.bitindex.org/api/addr/{address}/txs"
-                async with session.get(url, timeout=aiohttp.ClientTimeout(total=15)) as resp:
+            elif api_name == "Chainz":
+                # Chainz API - use correct endpoint
+                url = f"https://chainz.cryptoid.info/dash/api.dws"
+                params = {"q": "addresstxs", "a": address}
+                async with session.get(url, params=params, timeout=aiohttp.ClientTimeout(total=15)) as resp:
                     if resp.status == 429:
-                        _api_health.mark_ratelimit("Bitindex")
-                        logger.warning(f"Bitindex rate limited")
+                        _api_health.mark_ratelimit("Chainz")
+                        logger.warning(f"Chainz rate limited")
                         continue
                     if resp.status != 200:
-                        _api_health.mark_fail("Bitindex")
-                        logger.warning(f"Bitindex returned {resp.status}")
+                        _api_health.mark_fail("Chainz")
+                        logger.warning(f"Chainz returned {resp.status}")
                         continue
                     try:
                         data = await resp.json()
-                    except Exception:
-                        _api_health.mark_fail("Bitindex")
-                        logger.warning(f"Bitindex JSON parse error")
+                    except Exception as e:
+                        _api_health.mark_fail("Chainz")
+                        logger.warning(f"Chainz JSON parse error: {e}")
                         continue
                     
                     if isinstance(data, dict) and "error" in data:
-                        _api_health.mark_fail("Bitindex")
-                        logger.warning(f"Bitindex error: {data['error']}")
+                        _api_health.mark_fail("Chainz")
+                        logger.warning(f"Chainz error: {data['error']}")
                         continue
                     
-                    # Bitindex returns array directly
+                    # Chainz returns array directly
                     txs = data if isinstance(data, list) else []
                     
                     if not txs:
-                        logger.info(f"✓ Bitindex: 0 txs for {address[:16]}...")
-                        _api_health.mark_success("Bitindex")
+                        logger.info(f"✓ Chainz: 0 txs for {address[:16]}...")
+                        _api_health.mark_success("Chainz")
                         return []
                     
-                    converted = parse_bitindex_txs(txs, address)
+                    converted = parse_chainz_txs(txs, address)
                     for tx in converted:
-                        tx["_source"] = "Bitindex"
-                    _api_health.mark_success("Bitindex")
-                    logger.info(f"✓ Bitindex: {len(converted)} txs for {address[:16]}...")
+                        tx["_source"] = "Chainz"
+                    _api_health.mark_success("Chainz")
+                    logger.info(f"✓ Chainz: {len(converted)} txs for {address[:16]}...")
                     return converted
 
         except asyncio.TimeoutError:
@@ -766,8 +768,8 @@ def parse_blockchair_txs(addr_data: dict, watched_address: str) -> list[dict]:
     return converted
 
 
-def parse_bitindex_txs(data: list, watched_address: str) -> list[dict]:
-    """Convert Bitindex API response to BlockCypher-like format."""
+def parse_chainz_txs(data: list, watched_address: str) -> list[dict]:
+    """Convert Chainz API response to BlockCypher-like format."""
     if not isinstance(data, list):
         return []
     
@@ -779,10 +781,35 @@ def parse_bitindex_txs(data: list, watched_address: str) -> list[dict]:
             "hash": tx.get("txid"),
             "time": tx.get("time"),
             "received": tx.get("time"),
-            "inputs": tx.get("vin", []),
-            "outputs": tx.get("vout", []),
-            "_source": "Bitindex",
+            "confirmations": tx.get("confirmations", 0),
+            "inputs": [],
+            "outputs": [],
+            "_source": "Chainz",
         }
+        
+        # Parse inputs - Chainz format uses "addr" field
+        for vin in tx.get("vin", []):
+            if isinstance(vin, dict):
+                normalized["inputs"].append({
+                    "addresses": [vin["addr"]] if "addr" in vin else [],
+                    "address": vin.get("addr"),
+                })
+        
+        # Parse outputs - Chainz format
+        for vout in tx.get("vout", []):
+            if isinstance(vout, dict):
+                addresses = []
+                if "addresses" in vout and isinstance(vout["addresses"], list):
+                    addresses = vout["addresses"]
+                elif "address" in vout:
+                    addresses = [vout["address"]]
+                
+                normalized["outputs"].append({
+                    "addresses": addresses,
+                    "address": addresses[0] if addresses else None,
+                    "value": vout.get("value", 0),
+                })
+        
         if normalized["hash"]:
             converted.append(normalized)
     return converted
