@@ -826,38 +826,40 @@ def parse_chainz_txs(data: list, watched_address: str) -> list[dict]:
 def extract_tx_info(tx: dict, address: str) -> Optional[tuple[float, list[str], bool]]:
     """
     Extract received amount and senders from a blockchain transaction.
-    Handles both BlockCypher format (inputs/outputs) and Insight format (vin/vout).
-    Processes both confirmed and unconfirmed transactions.
-    Returns (amount_dash, [sender, ...], is_unconfirmed) or None.
+    Send ALL transactions (confirmed and unconfirmed) regardless of amount.
+    Returns (amount_dash, [sender, ...], is_unconfirmed) or None if not our address.
     """
-    # Normalize formats: BlockCypher uses inputs/outputs, Insight uses vin/vout
-    inputs = tx.get("inputs") or tx.get("vin", [])
-    outputs = tx.get("outputs") or tx.get("vout", [])
+    # Normalize formats: BlockCypher uses inputs/outputs
+    inputs = tx.get("inputs", [])
+    outputs = tx.get("outputs", [])
     
-    # ── Amount received by watched address ───────────────────────────────────
+    # ── Check if address is in outputs (receiving) ───────────────────────────
     total_satoshis = 0
+    found_in_outputs = False
+    
     for output in outputs:
-        # Support multiple address formats
         addresses = output.get("addresses", [])
         if not addresses and "address" in output:
             addresses = [output["address"]]
         
         if address in addresses:
+            found_in_outputs = True
             try:
                 total_satoshis += int(output.get("value", 0))
             except (TypeError, ValueError):
                 pass
-
-    if total_satoshis == 0:
+    
+    # If address not in outputs, skip this tx
+    if not found_in_outputs:
         return None
-
+    
+    # Convert to DASH (even if 0, we still send it)
     amount_dash = total_satoshis / 100_000_000
 
     # ── Extract sender addresses ─────────────────────────────────────────────
     seen: set[str] = set()
     senders: list[str] = []
     for inp in inputs:
-        # Support multiple formats
         addresses = inp.get("addresses", [])
         if not addresses and "address" in inp:
             addresses = [inp["address"]]
@@ -889,19 +891,28 @@ async def blockchain_poller(bot: Bot) -> None:
 
                 for address, user_ids in watched.items():
                     txs = await fetch_address_txs(session, address)
+                    logger.debug(f"Found {len(txs)} txs for {address[:16]}...")
+                    
                     for tx in txs:
                         txid = tx.get("hash", "")
                         if not txid:
+                            logger.debug(f"Skipping tx without hash")
                             continue
                         if await is_tx_seen(txid, address):
+                            logger.debug(f"Already seen {txid[:16]}...")
                             continue
+                        
+                        # Extract info (may return None if not receiving, but log it)
                         info = extract_tx_info(tx, address)
                         if info is None:
+                            logger.debug(f"extract_tx_info returned None for {txid[:16]}... (not receiving?)")
                             continue
+                        
                         amount, senders, is_unconfirmed = info
+                        logger.info(f"📥 New tx: {amount:.8f} DASH (unconfirmed={is_unconfirmed})")
                         await mark_tx_seen(txid, address)
 
-                        # Parse timestamp — unconfirmed txs use "received" field
+                        # Parse timestamp
                         tx_time = None
                         raw_time = tx.get("received") if is_unconfirmed else (
                             tx.get("confirmed") or tx.get("received")
@@ -914,6 +925,7 @@ async def blockchain_poller(bot: Bot) -> None:
                                 pass
 
                         for user_id in user_ids:
+                            logger.info(f"💬 Sending receipt to user {user_id}")
                             await notify_deposit(
                                 bot=bot,
                                 user_id=user_id,
