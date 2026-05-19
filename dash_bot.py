@@ -63,8 +63,9 @@ BLOCKCHAIN_APIS = [
     },
 ]
 
-POLLING_INTERVAL = 60  # seconds between blockchain checks
+POLLING_INTERVAL = 15  # seconds between blockchain checks (faster notifications)
 PRICE_CACHE_TTL = 120  # seconds to cache DASH/USD price
+INCLUDE_UNCONFIRMED = True  # Include unconfirmed mempool transactions for faster alerts
 
 logging.basicConfig(
     format="%(asctime)s | %(levelname)-8s | %(name)s | %(message)s",
@@ -649,22 +650,42 @@ async def fetch_address_txs(session: aiohttp.ClientSession, address: str) -> lis
         try:
             if api_name == "BlockCypher":
                 token_param = f"&token={BLOCKCYPHER_TOKEN}" if BLOCKCYPHER_TOKEN else ""
-                url = f"https://api.blockcypher.com/v1/dash/main/addrs/{address}/full?limit=10{token_param}"
-                async with session.get(url, timeout=aiohttp.ClientTimeout(total=15)) as resp:
+                results = []
+                
+                # Fetch confirmed transactions
+                url_confirmed = f"https://api.blockcypher.com/v1/dash/main/addrs/{address}/full?limit=10{token_param}"
+                async with session.get(url_confirmed, timeout=aiohttp.ClientTimeout(total=15)) as resp:
                     if resp.status == 429:
                         _api_health.mark_ratelimit("BlockCypher")
                         continue
+                    if resp.status == 200:
+                        data = await resp.json()
+                        results.extend(data.get("txs", []))
+                
+                # Fetch unconfirmed (mempool) transactions if enabled
+                if INCLUDE_UNCONFIRMED:
+                    url_unconfirmed = f"https://api.blockcypher.com/v1/dash/main/addrs/{address}/full?unconfirmedOnly=true{token_param}"
+                    try:
+                        async with session.get(url_unconfirmed, timeout=aiohttp.ClientTimeout(total=15)) as resp:
+                            if resp.status == 200:
+                                data = await resp.json()
+                                for tx in data.get("txs", []):
+                                    tx["_unconfirmed"] = True
+                                    results.append(tx)
+                    except Exception:
+                        pass  # Continue with confirmed txs if unconfirmed fails
+                
+                if not results:
                     if resp.status != 200:
                         _api_health.mark_fail("BlockCypher")
                         logger.warning(f"BlockCypher returned {resp.status}")
                         continue
-                    data = await resp.json()
-                    txs = data.get("txs", [])
-                    for tx in txs:
-                        tx["_source"] = "BlockCypher"
-                    _api_health.mark_success("BlockCypher")
-                    logger.info(f"✓ BlockCypher: {len(txs)} txs for {address[:16]}...")
-                    return txs
+                
+                for tx in results:
+                    tx["_source"] = "BlockCypher"
+                _api_health.mark_success("BlockCypher")
+                logger.info(f"✓ BlockCypher: {len(results)} txs for {address[:16]}...")
+                return results
 
             elif api_name == "Chainz.cryptoid":
                 # Chainz doesn't require auth but has strict format
