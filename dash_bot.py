@@ -40,7 +40,8 @@ from telegram.ext import (
 BOT_TOKEN = os.environ.get("BOT_TOKEN", "YOUR_BOT_TOKEN_HERE")
 DATABASE_URL = os.environ.get("DATABASE_URL", "")
 BLOCKCYPHER_TOKEN = os.environ.get("BLOCKCYPHER_TOKEN", "")
-BLOCKCYPHER_TOKEN_2 = os.environ.get("BLOCKCYPHER_TOKEN_2", "")  # Second backup token
+BLOCKCYPHER_TOKEN_2 = os.environ.get("BLOCKCYPHER_TOKEN_2", "")
+BLOCKCYPHER_TOKEN_3 = os.environ.get("BLOCKCYPHER_TOKEN_3", "")
 
 # Multiple blockchain API sources with automatic fallback
 BLOCKCHAIN_APIS = [
@@ -51,6 +52,8 @@ BLOCKCHAIN_APIS = [
         "enabled": True,
     },
 ]
+
+POLLING_INTERVAL = 45  # seconds between blockchain checks (was 15)
 
 POLLING_INTERVAL = 15  # seconds between blockchain checks (faster notifications)
 PRICE_CACHE_TTL = 120  # seconds to cache DASH/USD price
@@ -68,9 +71,45 @@ class APIHealthTracker:
     """Tracks API health and automatically switches to best performing API."""
     def __init__(self):
         self.api_stats: dict[str, dict] = {
-            "BlockCypher": {"success": 0, "fail": 0, "ratelimit": 0, "disabled_until": 0.0, "token_index": 0},
+            "BlockCypher": {
+                "success": 0, 
+                "fail": 0, 
+                "ratelimit": 0, 
+                "disabled_until": 0.0, 
+                "token_index": 0,
+                "token_ratelimited": [False, False, False]  # Track which tokens are rate limited
+            },
         }
         self.token_rotation = 0  # Track which token to use
+    
+    def get_next_token(self) -> int:
+        """Get next available token that's not rate limited"""
+        tokens = [BLOCKCYPHER_TOKEN, BLOCKCYPHER_TOKEN_2, BLOCKCYPHER_TOKEN_3]
+        available_tokens = [i for i, t in enumerate(tokens) if t]  # Only tokens that are configured
+        
+        if not available_tokens:
+            return -1
+        
+        # Find next non-rate-limited token
+        for _ in range(len(available_tokens)):
+            idx = available_tokens[self.token_rotation % len(available_tokens)]
+            self.token_rotation += 1
+            
+            if not self.api_stats["BlockCypher"]["token_ratelimited"][idx]:
+                return idx
+        
+        # If all rate limited, return next anyway (will fail and be marked)
+        return available_tokens[self.token_rotation % len(available_tokens)]
+    
+    def mark_token_ratelimited(self, token_idx: int) -> None:
+        """Mark a token as rate limited"""
+        if 0 <= token_idx < 3:
+            self.api_stats["BlockCypher"]["token_ratelimited"][token_idx] = True
+            logger.warning(f"Token #{token_idx + 1} rate limited, switching to next")
+    
+    def reset_token_limits(self) -> None:
+        """Reset all token limits every hour"""
+        self.api_stats["BlockCypher"]["token_ratelimited"] = [False, False, False]
     
     def mark_success(self, api_name: str) -> None:
         if api_name in self.api_stats:
@@ -636,18 +675,16 @@ async def fetch_address_txs(session: aiohttp.ClientSession, address: str) -> lis
 
         try:
             if api_name == "BlockCypher":
-                # Try with token rotation - alternate between 2 tokens
-                tokens = [BLOCKCYPHER_TOKEN, BLOCKCYPHER_TOKEN_2]
-                tokens = [t for t in tokens if t]  # Filter out empty tokens
+                # Get next available token (intelligent rotation)
+                token_idx = _api_health.get_next_token()
                 
-                if not tokens:
+                if token_idx == -1:
                     _api_health.mark_fail("BlockCypher")
                     logger.warning("No BlockCypher tokens configured")
                     continue
                 
-                # Rotate between available tokens on each request
-                current_token = tokens[_api_health.token_rotation % len(tokens)]
-                _api_health.token_rotation += 1
+                tokens = [BLOCKCYPHER_TOKEN, BLOCKCYPHER_TOKEN_2, BLOCKCYPHER_TOKEN_3]
+                current_token = tokens[token_idx]
                 
                 token_param = f"&token={current_token}"
                 results = []
@@ -657,8 +694,8 @@ async def fetch_address_txs(session: aiohttp.ClientSession, address: str) -> lis
                 try:
                     async with session.get(url_confirmed, timeout=aiohttp.ClientTimeout(total=15)) as resp:
                         if resp.status == 429:
-                            _api_health.mark_ratelimit("BlockCypher")
-                            logger.warning(f"BlockCypher rate limited (token {_api_health.token_rotation % len(tokens)})")
+                            _api_health.mark_token_ratelimited(token_idx)
+                            logger.warning(f"Token #{token_idx + 1} hit rate limit, trying next")
                             continue
                         if resp.status == 200:
                             data = await resp.json()
@@ -666,29 +703,29 @@ async def fetch_address_txs(session: aiohttp.ClientSession, address: str) -> lis
                 except Exception as e:
                     logger.warning(f"BlockCypher confirmed fetch error: {e}")
                 
-                # Fetch unconfirmed (mempool) transactions
-                if INCLUDE_UNCONFIRMED:
-                    url_unconfirmed = f"https://api.blockcypher.com/v1/dash/main/addrs/{address}/full?unconfirmedOnly=true{token_param}"
-                    try:
-                        async with session.get(url_unconfirmed, timeout=aiohttp.ClientTimeout(total=15)) as resp:
-                            if resp.status == 200:
-                                data = await resp.json()
-                                for tx in data.get("txs", []):
-                                    tx["_unconfirmed"] = True
-                                    results.append(tx)
-                    except Exception:
-                        pass  # Continue with confirmed txs if unconfirmed fails
+                # Fetch unconfirmed (mempool) transactions - ALWAYS show these
+                url_unconfirmed = f"https://api.blockcypher.com/v1/dash/main/addrs/{address}/full?unconfirmedOnly=true{token_param}"
+                try:
+                    async with session.get(url_unconfirmed, timeout=aiohttp.ClientTimeout(total=15)) as resp:
+                        if resp.status == 200:
+                            data = await resp.json()
+                            for tx in data.get("txs", []):
+                                tx["_unconfirmed"] = True
+                                results.append(tx)
+                        # Don't fail if unconfirmed endpoint has issues
+                except Exception as e:
+                    logger.debug(f"Unconfirmed fetch non-critical error: {e}")
                 
                 if results:
                     for tx in results:
                         tx["_source"] = "BlockCypher"
                     _api_health.mark_success("BlockCypher")
-                    logger.info(f"✓ BlockCypher: {len(results)} txs for {address[:16]}... (token {_api_health.token_rotation % len(tokens)})")
+                    logger.info(f"✓ BlockCypher: {len(results)} txs for {address[:16]}... (token #{token_idx + 1})")
                     return results
                 else:
-                    _api_health.mark_fail("BlockCypher")
-                    logger.warning(f"BlockCypher returned no results")
-                    continue
+                    logger.info(f"✓ BlockCypher: 0 txs for {address[:16]}... (token #{token_idx + 1})")
+                    _api_health.mark_success("BlockCypher")
+                    return []
 
         except asyncio.TimeoutError:
             _api_health.mark_fail("BlockCypher")
