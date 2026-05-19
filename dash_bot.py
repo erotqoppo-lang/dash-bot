@@ -851,16 +851,11 @@ def parse_chainz_txs(data: list, watched_address: str) -> list[dict]:
 def extract_tx_info(tx: dict, address: str) -> Optional[tuple[float, list[str], bool]]:
     """
     Extract received amount and senders from a blockchain transaction.
-    Handles both BlockCypher format (inputs/outputs) and Bitindex format (vin/vout).
-    Only processes confirmed transactions (confirmations > 0) unless explicitly unconfirmed.
+    Handles both BlockCypher format (inputs/outputs) and Insight format (vin/vout).
+    Processes both confirmed and unconfirmed transactions.
     Returns (amount_dash, [sender, ...], is_unconfirmed) or None.
     """
-    # Skip unconfirmed transactions unless explicitly marked
-    confirmations = tx.get("confirmations", 0)
-    if confirmations == 0 and not tx.get("_unconfirmed", False):
-        return None
-    
-    # Normalize formats: BlockCypher uses inputs/outputs, Bitindex uses vin/vout
+    # Normalize formats: BlockCypher uses inputs/outputs, Insight uses vin/vout
     inputs = tx.get("inputs") or tx.get("vin", [])
     outputs = tx.get("outputs") or tx.get("vout", [])
     
@@ -897,7 +892,10 @@ def extract_tx_info(tx: dict, address: str) -> Optional[tuple[float, list[str], 
                 seen.add(addr)
                 senders.append(addr)
 
-    is_unconfirmed = bool(confirmations == 0)
+    # Check if unconfirmed
+    confirmations = tx.get("confirmations", 0)
+    is_unconfirmed = confirmations == 0
+    
     return amount_dash, senders, is_unconfirmed
 
 
