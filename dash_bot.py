@@ -50,9 +50,9 @@ BLOCKCHAIN_APIS = [
         "enabled": True,
     },
     {
-        "name": "Chainz.cryptoid",
-        "base_url": "https://chainz.cryptoid.info/dash/api.dws",
-        "parse_fn": "parse_chainz",
+        "name": "Bitindex",
+        "base_url": "https://dashsight.bitindex.org/api",
+        "parse_fn": "parse_bitindex",
         "enabled": True,
     },
 ]
@@ -74,7 +74,7 @@ class APIHealthTracker:
     def __init__(self):
         self.api_stats: dict[str, dict] = {
             "BlockCypher": {"success": 0, "fail": 0, "ratelimit": 0, "disabled_until": 0.0},
-            "Chainz.cryptoid": {"success": 0, "fail": 0, "ratelimit": 0, "disabled_until": 0.0},
+            "Bitindex": {"success": 0, "fail": 0, "ratelimit": 0, "disabled_until": 0.0},
         }
     
     def mark_success(self, api_name: str) -> None:
@@ -679,42 +679,43 @@ async def fetch_address_txs(session: aiohttp.ClientSession, address: str) -> lis
                 logger.info(f"✓ BlockCypher: {len(results)} txs for {address[:16]}...")
                 return results
 
-            elif api_name == "Chainz.cryptoid":
-                # Chainz doesn't require auth but has strict format
-                url = f"https://chainz.cryptoid.info/dash/api.dws"
-                params = {"q": "addresstxs", "a": address, "limit": "10"}
-                async with session.get(url, params=params, timeout=aiohttp.ClientTimeout(total=15)) as resp:
+            elif api_name == "Bitindex":
+                url = f"https://dashsight.bitindex.org/api/addr/{address}/txs"
+                async with session.get(url, timeout=aiohttp.ClientTimeout(total=15)) as resp:
                     if resp.status == 429:
-                        _api_health.mark_ratelimit("Chainz.cryptoid")
-                        logger.warning(f"Chainz rate limited")
+                        _api_health.mark_ratelimit("Bitindex")
+                        logger.warning(f"Bitindex rate limited")
                         continue
                     if resp.status != 200:
-                        _api_health.mark_fail("Chainz.cryptoid")
-                        logger.warning(f"Chainz returned {resp.status}")
+                        _api_health.mark_fail("Bitindex")
+                        logger.warning(f"Bitindex returned {resp.status}")
                         continue
                     try:
                         data = await resp.json()
                     except Exception:
-                        _api_health.mark_fail("Chainz.cryptoid")
-                        logger.warning(f"Chainz JSON parse error")
+                        _api_health.mark_fail("Bitindex")
+                        logger.warning(f"Bitindex JSON parse error")
                         continue
                     
                     if isinstance(data, dict) and "error" in data:
-                        _api_health.mark_fail("Chainz.cryptoid")
-                        logger.warning(f"Chainz error: {data['error']}")
+                        _api_health.mark_fail("Bitindex")
+                        logger.warning(f"Bitindex error: {data['error']}")
                         continue
-                    if not isinstance(data, list) or len(data) == 0:
-                        # Empty response is OK, just no txs
-                        logger.info(f"✓ Chainz: 0 txs for {address[:16]}...")
-                        _api_health.mark_success("Chainz.cryptoid")
+                    
+                    # Bitindex returns array directly
+                    txs = data if isinstance(data, list) else []
+                    
+                    if not txs:
+                        logger.info(f"✓ Bitindex: 0 txs for {address[:16]}...")
+                        _api_health.mark_success("Bitindex")
                         return []
                     
-                    txs = parse_chainz_txs(data, address)
-                    for tx in txs:
-                        tx["_source"] = "Chainz"
-                    _api_health.mark_success("Chainz.cryptoid")
-                    logger.info(f"✓ Chainz: {len(txs)} txs for {address[:16]}...")
-                    return txs
+                    converted = parse_bitindex_txs(txs, address)
+                    for tx in converted:
+                        tx["_source"] = "Bitindex"
+                    _api_health.mark_success("Bitindex")
+                    logger.info(f"✓ Bitindex: {len(converted)} txs for {address[:16]}...")
+                    return converted
 
         except asyncio.TimeoutError:
             _api_health.mark_fail(api_name)
@@ -765,8 +766,8 @@ def parse_blockchair_txs(addr_data: dict, watched_address: str) -> list[dict]:
     return converted
 
 
-def parse_chainz_txs(data: list, watched_address: str) -> list[dict]:
-    """Convert Chainz API response format to BlockCypher-like format."""
+def parse_bitindex_txs(data: list, watched_address: str) -> list[dict]:
+    """Convert Bitindex API response to BlockCypher-like format."""
     if not isinstance(data, list):
         return []
     
@@ -775,12 +776,12 @@ def parse_chainz_txs(data: list, watched_address: str) -> list[dict]:
         if not isinstance(tx, dict):
             continue
         normalized = {
-            "hash": tx.get("txid") or tx.get("hash"),
+            "hash": tx.get("txid"),
             "time": tx.get("time"),
-            "received": tx.get("received") or tx.get("time"),
-            "inputs": tx.get("inputs", []),
-            "outputs": tx.get("outputs", []),
-            "_source": "Chainz",
+            "received": tx.get("time"),
+            "inputs": tx.get("vin", []),
+            "outputs": tx.get("vout", []),
+            "_source": "Bitindex",
         }
         if normalized["hash"]:
             converted.append(normalized)
@@ -789,14 +790,29 @@ def parse_chainz_txs(data: list, watched_address: str) -> list[dict]:
 
 def extract_tx_info(tx: dict, address: str) -> Optional[tuple[float, list[str], bool]]:
     """
-    Extract received amount and senders from a BlockCypher/Chainz transaction.
-    Uses satoshis (1 DASH = 100_000_000 satoshis).
+    Extract received amount and senders from a blockchain transaction.
+    Handles both BlockCypher format (inputs/outputs) and Bitindex format (vin/vout).
+    Only processes confirmed transactions (confirmations > 0) unless explicitly unconfirmed.
     Returns (amount_dash, [sender, ...], is_unconfirmed) or None.
     """
-    # ── Check if address is receiving (in outputs) ───────────────────────────
+    # Skip unconfirmed transactions unless explicitly marked
+    confirmations = tx.get("confirmations", 0)
+    if confirmations == 0 and not tx.get("_unconfirmed", False):
+        return None
+    
+    # Normalize formats: BlockCypher uses inputs/outputs, Bitindex uses vin/vout
+    inputs = tx.get("inputs") or tx.get("vin", [])
+    outputs = tx.get("outputs") or tx.get("vout", [])
+    
+    # ── Amount received by watched address ───────────────────────────────────
     total_satoshis = 0
-    for output in tx.get("outputs", []):
-        if address in output.get("addresses", []):
+    for output in outputs:
+        # Support multiple address formats
+        addresses = output.get("addresses", [])
+        if not addresses and "address" in output:
+            addresses = [output["address"]]
+        
+        if address in addresses:
             try:
                 total_satoshis += int(output.get("value", 0))
             except (TypeError, ValueError):
@@ -810,13 +826,18 @@ def extract_tx_info(tx: dict, address: str) -> Optional[tuple[float, list[str], 
     # ── Extract sender addresses ─────────────────────────────────────────────
     seen: set[str] = set()
     senders: list[str] = []
-    for inp in tx.get("inputs", []):
-        for addr in inp.get("addresses", []):
+    for inp in inputs:
+        # Support multiple formats
+        addresses = inp.get("addresses", [])
+        if not addresses and "address" in inp:
+            addresses = [inp["address"]]
+        
+        for addr in addresses:
             if addr and addr != address and addr not in seen:
                 seen.add(addr)
                 senders.append(addr)
 
-    is_unconfirmed = bool(tx.get("_unconfirmed", False))
+    is_unconfirmed = bool(confirmations == 0)
     return amount_dash, senders, is_unconfirmed
 
 
