@@ -85,9 +85,8 @@ class APIHealthTracker:
     def mark_ratelimit(self, api_name: str) -> None:
         if api_name in self.api_stats:
             self.api_stats[api_name]["ratelimit"] += 1
-            # Disable API for 5 minutes on rate limit
-            self.api_stats[api_name]["disabled_until"] = time.time() + 300
-            logger.warning(f"{api_name} RATE LIMITED — disabled for 5 minutes, switching to fallback")
+            # Don't lock out for 5 minutes, just skip this cycle
+            logger.warning(f"{api_name} rate limited, trying next API")
     
     def mark_fail(self, api_name: str) -> None:
         if api_name in self.api_stats:
