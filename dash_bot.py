@@ -46,9 +46,15 @@ BLOCKCYPHER_TOKEN_3 = os.environ.get("BLOCKCYPHER_TOKEN_3", "")
 # Multiple blockchain API sources with automatic fallback
 BLOCKCHAIN_APIS = [
     {
-        "name": "BlockCypher",
-        "base_url": "https://api.blockcypher.com/v1/dash/main",
-        "parse_fn": "parse_blockcypher",
+        "name": "Chainz",
+        "base_url": "https://chainz.cryptoid.info/dash",
+        "parse_fn": "parse_chainz",
+        "enabled": True,
+    },
+    {
+        "name": "Insight",
+        "base_url": "https://insight.dash.org/insight-api",
+        "parse_fn": "parse_insight",
         "enabled": True,
     },
 ]
@@ -71,29 +77,9 @@ class APIHealthTracker:
     """Tracks API health and automatically switches to best performing API."""
     def __init__(self):
         self.api_stats: dict[str, dict] = {
-            "BlockCypher": {
-                "success": 0, 
-                "fail": 0, 
-                "ratelimit": 0, 
-                "disabled_until": 0.0, 
-            },
+            "Chainz": {"success": 0, "fail": 0, "ratelimit": 0, "disabled_until": 0.0},
+            "Insight": {"success": 0, "fail": 0, "ratelimit": 0, "disabled_until": 0.0},
         }
-        self.token_index = 0
-    
-    def get_next_token(self) -> tuple[int, str]:
-        """Get next token in round-robin fashion"""
-        tokens = [BLOCKCYPHER_TOKEN, BLOCKCYPHER_TOKEN_2, BLOCKCYPHER_TOKEN_3]
-        
-        # Find first non-empty token
-        for i, token in enumerate(tokens):
-            if token:
-                # Return token at current index position
-                idx = (self.token_index + i) % len([t for t in tokens if t])
-                available = [t for t in tokens if t]
-                self.token_index = (self.token_index + 1) % len(available)
-                return i, available[idx]
-        
-        return -1, ""
     
     def mark_success(self, api_name: str) -> None:
         if api_name in self.api_stats:
@@ -658,45 +644,130 @@ async def fetch_address_txs(session: aiohttp.ClientSession, address: str) -> lis
             continue
 
         try:
-            if api_name == "BlockCypher":
-                # Get next token
-                token_idx, current_token = _api_health.get_next_token()
-                
-                if token_idx == -1 or not current_token:
-                    _api_health.mark_fail("BlockCypher")
-                    logger.warning("No BlockCypher tokens available")
-                    continue
-                
-                token_param = f"&token={current_token}"
-                
-                # Fetch ALL transactions (confirmed + unconfirmed)
-                url = f"https://api.blockcypher.com/v1/dash/main/addrs/{address}/full{token_param}"
-                async with session.get(url, timeout=aiohttp.ClientTimeout(total=15)) as resp:
+            if api_name == "Chainz":
+                url = "https://chainz.cryptoid.info/dash/api.dws"
+                params = {"q": "addresstxs", "a": address, "limit": "50"}
+                async with session.get(url, params=params, timeout=aiohttp.ClientTimeout(total=15)) as resp:
                     if resp.status == 429:
-                        logger.warning(f"Token #{token_idx + 1} rate limited (429)")
+                        _api_health.mark_ratelimit("Chainz")
+                        logger.warning("Chainz rate limited")
                         continue
                     if resp.status != 200:
-                        _api_health.mark_fail("BlockCypher")
-                        logger.warning(f"BlockCypher {resp.status}")
+                        _api_health.mark_fail("Chainz")
+                        logger.warning(f"Chainz {resp.status}")
                         continue
                     
-                    data = await resp.json()
-                    results = data.get("txs", [])
-                
-                for tx in results:
-                    tx["_source"] = "BlockCypher"
-                
-                _api_health.mark_success("BlockCypher")
-                logger.info(f"✓ BlockCypher: {len(results)} txs (token #{token_idx + 1})")
-                return results
+                    try:
+                        data = await resp.json()
+                        if isinstance(data, dict) and "error" in data:
+                            _api_health.mark_fail("Chainz")
+                            continue
+                        
+                        if not isinstance(data, list):
+                            logger.info(f"✓ Chainz: 0 txs")
+                            _api_health.mark_success("Chainz")
+                            return []
+                        
+                        # Convert Chainz format
+                        converted = []
+                        for tx in data:
+                            if not isinstance(tx, dict) or "txid" not in tx:
+                                continue
+                            
+                            normalized = {
+                                "hash": tx.get("txid"),
+                                "time": tx.get("time"),
+                                "received": tx.get("time"),
+                                "confirmations": tx.get("confirmations", 0),
+                                "inputs": [],
+                                "outputs": [],
+                                "_source": "Chainz",
+                            }
+                            
+                            for vin in tx.get("vin", []):
+                                if isinstance(vin, dict) and "addr" in vin:
+                                    normalized["inputs"].append({"addresses": [vin["addr"]]})
+                            
+                            for vout in tx.get("vout", []):
+                                if isinstance(vout, dict):
+                                    addresses = []
+                                    if "addresses" in vout and isinstance(vout["addresses"], list):
+                                        addresses = vout["addresses"]
+                                    normalized["outputs"].append({"addresses": addresses, "value": vout.get("value", 0)})
+                            
+                            if normalized["hash"]:
+                                converted.append(normalized)
+                        
+                        _api_health.mark_success("Chainz")
+                        logger.info(f"✓ Chainz: {len(converted)} txs")
+                        return converted
+                    
+                    except Exception as e:
+                        _api_health.mark_fail("Chainz")
+                        logger.warning(f"Chainz error: {e}")
+                        continue
+
+            elif api_name == "Insight":
+                url = f"https://insight.dash.org/insight-api/addrs/{address}/txs"
+                async with session.get(url, timeout=aiohttp.ClientTimeout(total=15)) as resp:
+                    if resp.status == 429:
+                        _api_health.mark_ratelimit("Insight")
+                        logger.warning("Insight rate limited")
+                        continue
+                    if resp.status != 200:
+                        _api_health.mark_fail("Insight")
+                        logger.warning(f"Insight {resp.status}")
+                        continue
+                    
+                    try:
+                        data = await resp.json()
+                        txs = data if isinstance(data, list) else []
+                        
+                        converted = []
+                        for tx in txs:
+                            if not isinstance(tx, dict) or "txid" not in tx:
+                                continue
+                            
+                            normalized = {
+                                "hash": tx.get("txid"),
+                                "time": tx.get("time"),
+                                "received": tx.get("time"),
+                                "confirmations": tx.get("confirmations", 0),
+                                "inputs": [],
+                                "outputs": [],
+                                "_source": "Insight",
+                            }
+                            
+                            for vin in tx.get("vin", []):
+                                if isinstance(vin, dict) and "addr" in vin:
+                                    normalized["inputs"].append({"addresses": [vin["addr"]]})
+                            
+                            for vout in tx.get("vout", []):
+                                if isinstance(vout, dict):
+                                    addresses = []
+                                    if "scriptPubKey" in vout and isinstance(vout["scriptPubKey"], dict):
+                                        addresses = vout["scriptPubKey"].get("addresses", [])
+                                    normalized["outputs"].append({"addresses": addresses, "value": vout.get("value", 0)})
+                            
+                            if normalized["hash"]:
+                                converted.append(normalized)
+                        
+                        _api_health.mark_success("Insight")
+                        logger.info(f"✓ Insight: {len(converted)} txs")
+                        return converted
+                    
+                    except Exception as e:
+                        _api_health.mark_fail("Insight")
+                        logger.warning(f"Insight error: {e}")
+                        continue
 
         except asyncio.TimeoutError:
-            _api_health.mark_fail("BlockCypher")
-            logger.warning(f"BlockCypher timeout")
+            _api_health.mark_fail(api_name)
+            logger.warning(f"{api_name} timeout")
             continue
         except Exception as exc:
-            _api_health.mark_fail("BlockCypher")
-            logger.error(f"BlockCypher error: {exc}")
+            _api_health.mark_fail(api_name)
+            logger.error(f"{api_name} error: {exc}")
             continue
 
     logger.error(f"⚠ All APIs failed for {address[:16]}...")
