@@ -937,7 +937,9 @@ async def blockchain_poller(bot: Bot) -> None:
                                 senders=senders,
                                 is_unconfirmed=is_unconfirmed,
                             )
-                    await asyncio.sleep(1)
+                    
+                    # Wait between address checks to avoid rate limiting all tokens
+                    await asyncio.sleep(5)
 
             except Exception as exc:
                 logger.exception("Poller error: %s", exc)
