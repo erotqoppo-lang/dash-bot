@@ -78,19 +78,22 @@ class APIHealthTracker:
                 "disabled_until": 0.0, 
             },
         }
-        self.token_index = 0  # Simple counter for round-robin
+        self.token_index = 0
     
-    def get_next_token(self) -> int:
+    def get_next_token(self) -> tuple[int, str]:
         """Get next token in round-robin fashion"""
         tokens = [BLOCKCYPHER_TOKEN, BLOCKCYPHER_TOKEN_2, BLOCKCYPHER_TOKEN_3]
-        available = [i for i, t in enumerate(tokens) if t]
         
-        if not available:
-            return -1
+        # Find first non-empty token
+        for i, token in enumerate(tokens):
+            if token:
+                # Return token at current index position
+                idx = (self.token_index + i) % len([t for t in tokens if t])
+                available = [t for t in tokens if t]
+                self.token_index = (self.token_index + 1) % len(available)
+                return i, available[idx]
         
-        idx = available[self.token_index % len(available)]
-        self.token_index += 1
-        return idx
+        return -1, ""
     
     def mark_success(self, api_name: str) -> None:
         if api_name in self.api_stats:
@@ -656,21 +659,17 @@ async def fetch_address_txs(session: aiohttp.ClientSession, address: str) -> lis
 
         try:
             if api_name == "BlockCypher":
-                # Simple round-robin token rotation
-                token_idx = _api_health.get_next_token()
+                # Get next token
+                token_idx, current_token = _api_health.get_next_token()
                 
-                if token_idx == -1:
+                if token_idx == -1 or not current_token:
                     _api_health.mark_fail("BlockCypher")
-                    logger.warning("No BlockCypher tokens configured")
+                    logger.warning("No BlockCypher tokens available")
                     continue
                 
-                tokens = [BLOCKCYPHER_TOKEN, BLOCKCYPHER_TOKEN_2, BLOCKCYPHER_TOKEN_3]
-                current_token = tokens[token_idx]
-                
                 token_param = f"&token={current_token}"
-                results = []
                 
-                # Fetch confirmed + unconfirmed in ONE request
+                # Fetch ALL transactions (confirmed + unconfirmed)
                 url = f"https://api.blockcypher.com/v1/dash/main/addrs/{address}/full{token_param}"
                 async with session.get(url, timeout=aiohttp.ClientTimeout(total=15)) as resp:
                     if resp.status == 429:
@@ -688,7 +687,7 @@ async def fetch_address_txs(session: aiohttp.ClientSession, address: str) -> lis
                     tx["_source"] = "BlockCypher"
                 
                 _api_health.mark_success("BlockCypher")
-                logger.info(f"✓ BlockCypher: {len(results)} txs for {address[:16]}... (token #{token_idx + 1})")
+                logger.info(f"✓ BlockCypher: {len(results)} txs (token #{token_idx + 1})")
                 return results
 
         except asyncio.TimeoutError:
