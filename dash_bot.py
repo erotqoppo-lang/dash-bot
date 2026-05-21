@@ -46,9 +46,9 @@ BLOCKCYPHER_TOKEN_3 = os.environ.get("BLOCKCYPHER_TOKEN_3", "")
 # Multiple blockchain API sources with automatic fallback
 BLOCKCHAIN_APIS = [
     {
-        "name": "BlockCypher",
-        "base_url": "https://api.blockcypher.com/v1/dash/main",
-        "parse_fn": "parse_blockcypher",
+        "name": "Insight",
+        "base_url": "https://insight.dash.org/insight-api",
+        "parse_fn": "parse_insight",
         "enabled": True,
     },
 ]
@@ -69,7 +69,7 @@ class APIHealthTracker:
     """Tracks API health and automatically switches to best performing API."""
     def __init__(self):
         self.api_stats: dict[str, dict] = {
-            "BlockCypher": {"success": 0, "fail": 0, "ratelimit": 0, "disabled_until": 0.0},
+            "Insight": {"success": 0, "fail": 0, "ratelimit": 0, "disabled_until": 0.0},
         }
         self.token_idx = 0
     
@@ -649,47 +649,40 @@ async def fetch_address_txs(session: aiohttp.ClientSession, address: str) -> lis
             continue
 
         try:
-            if api_name == "BlockCypher":
-                token_num, token = _api_health.get_token()
-                
-                if token_num == -1 or not token:
-                    _api_health.mark_fail("BlockCypher")
-                    logger.warning("No tokens configured")
-                    continue
-                
-                token_param = f"&token={token}"
-                url = f"https://api.blockcypher.com/v1/dash/main/addrs/{address}/full{token_param}"
-                
+            if api_name == "Insight":
+                url = f"https://insight.dash.org/insight-api/addrs/{address}/txs"
                 async with session.get(url, timeout=aiohttp.ClientTimeout(total=15)) as resp:
                     if resp.status == 429:
-                        logger.warning(f"Token #{token_num} rate limited (429)")
+                        _api_health.mark_ratelimit("Insight")
+                        logger.warning("Insight rate limited")
                         continue
-                    if resp.status == 404:
-                        logger.info(f"✓ BlockCypher: 0 txs (address not found)")
-                        _api_health.mark_success("BlockCypher")
-                        return []
                     if resp.status != 200:
-                        _api_health.mark_fail("BlockCypher")
-                        logger.warning(f"BlockCypher {resp.status}")
+                        _api_health.mark_fail("Insight")
+                        logger.warning(f"Insight {resp.status}")
                         continue
                     
-                    data = await resp.json()
-                    txs = data.get("txs", [])
-                
-                for tx in txs:
-                    tx["_source"] = "BlockCypher"
-                
-                _api_health.mark_success("BlockCypher")
-                logger.info(f"✓ BlockCypher: {len(txs)} txs (token #{token_num})")
-                return txs
+                    try:
+                        data = await resp.json()
+                        txs = data if isinstance(data, list) else []
+                        
+                        for tx in txs:
+                            tx["_source"] = "Insight"
+                        
+                        _api_health.mark_success("Insight")
+                        logger.info(f"✓ Insight: {len(txs)} txs")
+                        return txs
+                    except Exception as e:
+                        _api_health.mark_fail("Insight")
+                        logger.warning(f"Insight error: {e}")
+                        continue
 
         except asyncio.TimeoutError:
-            _api_health.mark_fail("BlockCypher")
-            logger.warning("BlockCypher timeout")
+            _api_health.mark_fail("Insight")
+            logger.warning("Insight timeout")
             continue
         except Exception as exc:
-            _api_health.mark_fail("BlockCypher")
-            logger.error(f"BlockCypher error: {exc}")
+            _api_health.mark_fail("Insight")
+            logger.error(f"Insight error: {exc}")
             continue
 
     logger.error(f"⚠ All APIs failed for {address[:16]}...")
