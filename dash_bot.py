@@ -180,41 +180,8 @@ async def mark_tx_seen(user_id: int, txid: str, address: str):
             user_id, txid, address
         )
 
-async def add_authorized_user_to_db(user_id: int, added_by: int) -> bool:
-    if is_super_admin_id(user_id):
-        return False
-    try:
-        async with _pool.acquire() as conn:
-            await conn.execute(
-                "INSERT INTO authorized_users(user_id, added_by, created_at) VALUES ($1, $2, $3) ON CONFLICT DO NOTHING",
-                user_id, added_by, int(time.time())
-            )
-        return True
-    except:
-        return False
-
-async def remove_authorized_user_from_db(user_id: int) -> bool:
-    async with _pool.acquire() as conn:
-        result = await conn.execute("DELETE FROM authorized_users WHERE user_id = $1", user_id)
-        return result != "DELETE 0"
-
-async def is_db_authorized_user(user_id: int) -> bool:
-    async with _pool.acquire() as conn:
-        row = await conn.fetchrow("SELECT 1 FROM authorized_users WHERE user_id = $1", user_id)
-        return row is not None
-
-async def get_authorized_users() -> List:
-    async with _pool.acquire() as conn:
-        rows = await conn.fetch("SELECT user_id, added_by FROM authorized_users ORDER BY created_at DESC")
-        return rows
-
 async def get_all_active_user_ids() -> List[int]:
-    users = set(ADMIN_CHAT_IDS)
-    async with _pool.acquire() as conn:
-        rows = await conn.fetch("SELECT user_id FROM authorized_users")
-        for row in rows:
-            users.add(int(row['user_id']))
-    return sorted(users)
+    return sorted(ADMIN_CHAT_IDS)
 
 # -------------------------
 # Translations
@@ -389,7 +356,7 @@ async def is_admin(update: Update) -> bool:
     user = update.effective_user
     if not user:
         return False
-    return is_super_admin_id(user.id) or await is_db_authorized_user(user.id)
+    return is_super_admin_id(user.id)
 
 def parse_add_input(text: str) -> Tuple[str, str]:
     text = text.strip()
@@ -411,8 +378,6 @@ async def build_main_menu(user_id: int) -> InlineKeyboardMarkup:
         [InlineKeyboardButton(await _(user_id, "btn_check_now"), callback_data="check_now")],
         [InlineKeyboardButton(await _(user_id, "btn_language"), callback_data="language")],
     ]
-    if is_super_admin_id(user_id):
-        rows.append([InlineKeyboardButton(await _(user_id, "btn_authorization"), callback_data="auth_panel")])
     return InlineKeyboardMarkup(rows)
 
 async def build_auth_menu(user_id: int) -> InlineKeyboardMarkup:
@@ -522,62 +487,6 @@ async def panel_click(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await query.edit_message_text(text, reply_markup=await build_main_menu(user_id))
         return
 
-    if data == "auth_panel":
-        if not is_super_admin_id(user_id):
-            text = await _(user_id, "super_admin_only")
-            await query.edit_message_text(text, reply_markup=await build_main_menu(user_id))
-            return
-        text = await _(user_id, "authorization_menu")
-        await query.edit_message_text(text, reply_markup=await build_auth_menu(user_id))
-        return
-
-    if data == "auth_add":
-        if not is_super_admin_id(user_id):
-            text = await _(user_id, "super_admin_only")
-            await query.edit_message_text(text, reply_markup=await build_main_menu(user_id))
-            return
-        text = await _(user_id, "authorize_prompt")
-        await query.edit_message_text(text)
-        return AUTHORIZE_USER
-
-    if data == "auth_list":
-        if not is_super_admin_id(user_id):
-            text = await _(user_id, "super_admin_only")
-            await query.edit_message_text(text, reply_markup=await build_main_menu(user_id))
-            return
-        
-        rows = await get_authorized_users()
-        if not rows:
-            text = await _(user_id, "authorized_users_empty")
-            await query.edit_message_text(text, reply_markup=await build_auth_menu(user_id))
-            return
-        
-        header = await _(user_id, "authorized_users_header")
-        lines = [header]
-        keyboard = []
-        for row in rows:
-            lines.append(f"`{row['user_id']}`")
-            remove_text = await _(user_id, "btn_remove_user", target_id=row['user_id'])
-            keyboard.append([InlineKeyboardButton(remove_text, callback_data=f"auth_remove:{row['user_id']}")])
-        
-        back_text = await _(user_id, "btn_back")
-        keyboard.append([InlineKeyboardButton(back_text, callback_data="auth_panel")])
-        await query.edit_message_text("\n".join(lines), reply_markup=InlineKeyboardMarkup(keyboard), parse_mode='Markdown')
-        return
-
-    if data.startswith("auth_remove:"):
-        if not is_super_admin_id(user_id):
-            text = await _(user_id, "super_admin_only")
-            await query.edit_message_text(text, reply_markup=await build_main_menu(user_id))
-            return
-        
-        target_user_id = int(data.split(":", 1)[1])
-        success = await remove_authorized_user_from_db(target_user_id)
-        msg_key = "remove_user_success" if success else "remove_user_fail"
-        text = await _(user_id, msg_key)
-        await query.edit_message_text(text, reply_markup=await build_auth_menu(user_id))
-        return
-
     if data == "back_main":
         text = await _(user_id, "main_menu")
         await query.edit_message_text(text, reply_markup=await build_main_menu(user_id))
@@ -601,27 +510,6 @@ async def add_address_received(update: Update, context: ContextTypes.DEFAULT_TYP
     success, msg = await add_address_to_db(user_id, address, label)
     reply_msg = msg
     await update.message.reply_text(reply_msg, reply_markup=await build_main_menu(user_id))
-    return ConversationHandler.END
-
-async def authorize_user_received(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-    user = update.effective_user
-    if not user or not is_super_admin_id(user.id):
-        await update.message.reply_text("❌ Unauthorized")
-        return ConversationHandler.END
-    
-    user_id = user.id
-    text = update.message.text.strip()
-    target_user_id = parse_user_id_input(text)
-    
-    if not target_user_id:
-        invalid_text = await _(user_id, "invalid_user_id")
-        await update.message.reply_text(invalid_text, reply_markup=await build_auth_menu(user_id))
-        return AUTHORIZE_USER
-    
-    added = await add_authorized_user_to_db(target_user_id, user_id)
-    key = "authorize_success" if added else "authorize_exists"
-    msg_text = await _(user_id, key, target_id=target_user_id)
-    await update.message.reply_text(msg_text, reply_markup=await build_auth_menu(user_id), parse_mode="Markdown")
     return ConversationHandler.END
 
 async def cancel(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
@@ -724,11 +612,9 @@ async def main():
     conv = ConversationHandler(
         entry_points=[
             CallbackQueryHandler(panel_click, pattern="^add$"),
-            CallbackQueryHandler(panel_click, pattern="^auth_add$"),
         ],
         states={
             ADD_ADDRESS: [MessageHandler(filters.TEXT & ~filters.COMMAND, add_address_received)],
-            AUTHORIZE_USER: [MessageHandler(filters.TEXT & ~filters.COMMAND, authorize_user_received)],
         },
         fallbacks=[CommandHandler("cancel", cancel)],
     )
