@@ -633,17 +633,7 @@ async def main():
     logger.info(f"⏱ Scan every {CHECK_INTERVAL_SECONDS}s")
     logger.info("=" * 50)
 
-    async with app:
-        await app.start()
-        await app.updater.start_polling()
-        try:
-            await asyncio.Event().wait()
-        except (KeyboardInterrupt, SystemExit):
-            logger.info("Shutdown signal received")
-        finally:
-            if _pool:
-                await _pool.close()
-                logger.info("Database pool closed")
+    await app.run_polling()
 
 if __name__ == "__main__":
     asyncio.run(main())
