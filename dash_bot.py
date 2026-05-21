@@ -1,30 +1,17 @@
-"""
-Production-ready Telegram Bot for DASH Address Tracking
-Requirements: python-telegram-bot>=20.0, aiohttp, asyncpg
-Install: pip install "python-telegram-bot>=20.0" aiohttp asyncpg
-"""
-
 import asyncio
 import logging
 import os
-import re
 import time
-from datetime import datetime, timezone
-from typing import Optional
+from datetime import datetime, timedelta, timezone
+from typing import List, Optional, Tuple
 
 import aiohttp
 import asyncpg
-from telegram import (
-    Bot,
-    CallbackQuery,
-    InlineKeyboardButton,
-    InlineKeyboardMarkup,
-    Update,
-)
-from telegram.constants import ParseMode
-from telegram.error import BadRequest, TelegramError
+from dotenv import load_dotenv
+from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Update
 from telegram.ext import (
     Application,
+    ApplicationBuilder,
     CallbackQueryHandler,
     CommandHandler,
     ContextTypes,
@@ -33,944 +20,744 @@ from telegram.ext import (
     filters,
 )
 
-# ─────────────────────────── CONFIGURATION ────────────────────────────────────
+load_dotenv()
 
-# ─────────────────────────── CONFIGURATION ────────────────────────────────────
+# =========================
+# CONFIG
+# =========================
+BOT_TOKEN = os.getenv("BOT_TOKEN", "")
+DATABASE_URL = os.getenv("DATABASE_URL", "")
+ADMIN_CHAT_IDS = [int(x.strip()) for x in os.getenv("ADMIN_CHAT_IDS", "").split(",") if x.strip().isdigit()]
 
-BOT_TOKEN = os.environ.get("BOT_TOKEN", "YOUR_BOT_TOKEN_HERE")
-DATABASE_URL = os.environ.get("DATABASE_URL", "")
+CHECK_INTERVAL_SECONDS = 60  # Every minute
+TZ_OFFSET_HOURS = 4
+
 # Insight API (official Dash explorer)
 INSIGHT_ADDR_API = "https://insight.dash.org/insight-api/addr/{address}"
 INSIGHT_TX_API = "https://insight.dash.org/insight-api/tx/{txid}"
 EXPLORER_TX_URL = "https://insight.dash.org/insight/tx/{txid}"
 
-# Multiple blockchain API sources with automatic fallback
-BLOCKCHAIN_APIS = [
-    {
-        "name": "Insight",
-        "base_url": "https://insight.dash.org/insight-api",
-        "parse_fn": "parse_insight",
-        "enabled": True,
-    },
-]
-
-POLLING_INTERVAL = 60  # Check every 60 seconds
-PRICE_CACHE_TTL = 120  # seconds to cache DASH/USD price
-INCLUDE_UNCONFIRMED = True  # Show unconfirmed transactions immediately
-
 logging.basicConfig(
-    format="%(asctime)s | %(levelname)-8s | %(name)s | %(message)s",
+    format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
     level=logging.INFO,
 )
 logger = logging.getLogger(__name__)
 
-# ─────────────────────────── BLOCKCHAIN API HEALTH TRACKER ─────────────────────
+ADD_ADDRESS = 1
+AUTHORIZE_USER = 2
 
-class APIHealthTracker:
-    """Tracks API health and automatically switches to best performing API."""
-    def __init__(self):
-        self.api_stats: dict[str, dict] = {
-            "Insight": {"success": 0, "fail": 0, "ratelimit": 0, "disabled_until": 0.0},
-        }
-    
-    def get_token(self) -> tuple[int, str]:
-        """Get next token in simple round-robin"""
-        tokens = [BLOCKCYPHER_TOKEN, BLOCKCYPHER_TOKEN_2, BLOCKCYPHER_TOKEN_3]
-        available = [t for t in tokens if t]
-        
-        if not available:
-            return -1, ""
-        
-        token = available[self.token_idx % len(available)]
-        token_num = tokens.index(token) + 1
-        self.token_idx += 1
-        return token_num, token
-    
-    def mark_success(self, api_name: str) -> None:
-        if api_name in self.api_stats:
-            self.api_stats[api_name]["success"] += 1
-            logger.info(f"{api_name} success | Stats: {self.api_stats[api_name]}")
-    
-    def mark_ratelimit(self, api_name: str) -> None:
-        if api_name in self.api_stats:
-            self.api_stats[api_name]["ratelimit"] += 1
-            # Don't lock out for 5 minutes, just skip this cycle
-            logger.warning(f"{api_name} rate limited, trying next API")
-    
-    def mark_fail(self, api_name: str) -> None:
-        if api_name in self.api_stats:
-            self.api_stats[api_name]["fail"] += 1
-            logger.warning(f"{api_name} failed")
-    
-    def is_available(self, api_name: str) -> bool:
-        if api_name not in self.api_stats:
-            return True
-        return time.time() > self.api_stats[api_name]["disabled_until"]
-    
-    def get_best_api(self) -> Optional[str]:
-        """Return the best available API by success rate."""
-        available = [(name, self._score(name)) for name in self.api_stats 
-                    if self.is_available(name)]
-        if not available:
-            return None
-        return max(available, key=lambda x: x[1])[0]
-    
-    def _score(self, api_name: str) -> float:
-        if api_name not in self.api_stats:
-            return 0.0
-        stats = self.api_stats[api_name]
-        total = stats["success"] + stats["fail"] + stats["ratelimit"]
-        if total == 0:
-            return 1.0
-        return stats["success"] / total
-
-_api_health = APIHealthTracker()
-
-# ─────────────────────────── PRICE CACHE ──────────────────────────────────────
-
-_price_cache: dict = {"price": None, "fetched_at": 0.0}
-
-
-async def get_dash_usd_price(session: aiohttp.ClientSession) -> Optional[float]:
-    """Fetch current DASH/USD price from CoinGecko. Cached for PRICE_CACHE_TTL seconds."""
-    now = time.time()
-    if _price_cache["price"] is not None and (now - _price_cache["fetched_at"]) < PRICE_CACHE_TTL:
-        return _price_cache["price"]
-    url = "https://api.coingecko.com/api/v3/simple/price?ids=dash&vs_currencies=usd"
-    try:
-        async with session.get(url, timeout=aiohttp.ClientTimeout(total=10)) as resp:
-            if resp.status != 200:
-                logger.warning("CoinGecko price API returned %d", resp.status)
-                return _price_cache["price"]
-            data = await resp.json()
-            price = float(data["dash"]["usd"])
-            _price_cache["price"] = price
-            _price_cache["fetched_at"] = now
-            logger.info("DASH/USD price updated: $%.4f", price)
-            return price
-    except Exception as exc:
-        logger.error("Failed to fetch DASH/USD price: %s", exc)
-        return _price_cache["price"]
-
-
-def dash_to_usd(amount_dash: float, price_usd: Optional[float]) -> str:
-    if price_usd is None:
-        return f"{amount_dash:.8f} DASH"
-    return f"${amount_dash * price_usd:,.2f}"
-
-
-# ─────────────────────────── CONVERSATION STATES ──────────────────────────────
-
-WAITING_ADDRESS = 1
-
-# ─────────────────────────── TRANSLATIONS ─────────────────────────────────────
-
-TEXTS = {
-    "en": {
-        "welcome": "👋 Welcome to DASH Address Tracker!\nUse the menu below:",
-        "menu_add": "➕ Add Address",
-        "menu_list": "📋 My Addresses",
-        "menu_delete": "🗑 Delete Address",
-        "menu_lang": "🌐 Change Language",
-        "ask_address": "📥 Please enter your DASH address:",
-        "invalid_address": "❌ Invalid DASH address format. Please try again or /cancel:",
-        "address_saved": "✅ Address <code>{address}</code> saved successfully!",
-        "address_exists": "⚠️ Address <code>{address}</code> is already in your list.",
-        "no_addresses": "📭 You have no saved addresses yet.",
-        "addresses_header": "📋 <b>Your DASH Addresses:</b>",
-        "choose_lang": "🌐 Choose your language:",
-        "lang_set": "✅ Language set to English.",
-        "lang_en": "🇬🇧 English",
-        "lang_hy": "🇦🇲 Armenian",
-        "back": "⬅️ Back",
-        "cancel": "🚫 Operation cancelled.",
-        "delete_choose": "🗑 <b>Choose address to delete:</b>",
-        "delete_confirm": "❓ Are you sure you want to delete:\n<code>{address}</code>?",
-        "delete_yes": "✅ Yes, delete",
-        "delete_no": "❌ Cancel",
-        "delete_done": "✅ Address deleted:\n<code>{address}</code>",
-        "delete_no_addresses": "📭 No addresses to delete.",
-        "deposit_notify": (
-            "💰 <b>Incoming DASH Transaction!</b>{unconfirmed_badge}\n\n"
-            "📋 Receipt #{receipt_number}\n"
-            "🕐 Time: <b>{timestamp}</b>\n"
-            "📤 From: {senders_text}\n"
-            "📬 To: <code>{address}</code>\n"
-            "💵 Amount: <b>{amount_usd}</b>  <i>({amount_dash} DASH)</i>\n"
-            "📈 Rate: <b>1 DASH = {rate}</b>\n"
-            "🔗 TX: <a href=\"{tx_url}\">{txid_short}...{txid_tail}</a>"
-        ),
-    },
-    "hy": {
-        "welcome": "👋 Բարի գալուստ DASH Address Tracker!\nՕգտագործեք ստորև ընտրացանկը:",
-        "menu_add": "➕ Ավելացնել հասցե",
-        "menu_list": "📋 Իմ հասցեները",
-        "menu_delete": "🗑 Ջնջել հասցե",
-        "menu_lang": "🌐 Փոխել լեզուն",
-        "ask_address": "📥 Մուտքագրեք ձեր DASH հասցեն:",
-        "invalid_address": "❌ DASH հասցեի սխալ ձևաչափ: Փորձեք կրկին կամ /cancel:",
-        "address_saved": "✅ Հասցե <code>{address}</code> հաջողությամբ պահպանված է:",
-        "address_exists": "⚠️ Հասցե <code>{address}</code> արդեն ձեր ցուցակում է:",
-        "no_addresses": "📭 Դուք դեռ պահպանված հասցե չունեք:",
-        "addresses_header": "📋 <b>Ձեր DASH հասցեները:</b>",
-        "choose_lang": "🌐 Ընտրեք ձեր լեզուն:",
-        "lang_set": "✅ Լեզուն սահմանված է հայերեն:",
-        "lang_en": "🇬🇧 Անգլերեն",
-        "lang_hy": "🇦🇲 Հայերեն",
-        "back": "⬅️ Հետ",
-        "cancel": "🚫 Գործողությունը չեղարկված է:",
-        "delete_choose": "🗑 <b>Ընտրեք ջնջելու հասցեն:</b>",
-        "delete_confirm": "❓ Վստա՞հ եք որ ուզում եք ջնջել:\n<code>{address}</code>?",
-        "delete_yes": "✅ Այո, ջնջել",
-        "delete_no": "❌ Չեղարկել",
-        "delete_done": "✅ Հասցեն ջնջված է:\n<code>{address}</code>",
-        "delete_no_addresses": "📭 Ջնջելու հասցե չկա:",
-        "deposit_notify": (
-            "💰 <b>Մուտքային DASH Գործարք!</b>{unconfirmed_badge}\n\n"
-            "📋 Անդորրագիր #{receipt_number}\n"
-            "🕐 Ժամը: <b>{timestamp}</b>\n"
-            "📤 Ուղարկողը: {senders_text}\n"
-            "📬 Ստացողը: <code>{address}</code>\n"
-            "💵 Գումար: <b>{amount_usd}</b>  <i>({amount_dash} DASH)</i>\n"
-            "📈 Կուրս: <b>1 DASH = {rate}</b>\n"
-            "🔗 TX: <a href=\"{tx_url}\">{txid_short}...{txid_tail}</a>"
-        ),
-    },
-}
-
-# ─────────────────────────── DATABASE ─────────────────────────────────────────
-
-
-# ─────────────────────────── DATABASE ─────────────────────────────────────────
-
-# Global connection pool — created once in main()
+# Global pool
 _pool: Optional[asyncpg.Pool] = None
 
+# User scan locks
+USER_SCAN_LOCKS = {}
 
-async def get_pool() -> asyncpg.Pool:
+def get_user_scan_lock(user_id: int) -> asyncio.Lock:
+    if user_id not in USER_SCAN_LOCKS:
+        USER_SCAN_LOCKS[user_id] = asyncio.Lock()
+    return USER_SCAN_LOCKS[user_id]
+
+# -------------------------
+# Rate limiter
+# -------------------------
+class RateLimiter:
+    def __init__(self, max_calls_per_minute=30):
+        self.max_calls_per_minute = max_calls_per_minute
+        self.calls = []
+        self.backoff_time = 0
+
+    async def wait(self):
+        now = time.time()
+        self.calls = [t for t in self.calls if now - t < 60]
+        if self.backoff_time > now:
+            wait_time = self.backoff_time - now
+            logger.warning(f"Rate limit backoff: waiting {wait_time:.1f}s")
+            await asyncio.sleep(wait_time)
+            return await self.wait()
+        if len(self.calls) >= self.max_calls_per_minute:
+            oldest = min(self.calls)
+            wait_time = 60 - (now - oldest) + 2
+            logger.warning(f"Rate limit reached, waiting {wait_time:.1f}s")
+            self.backoff_time = now + wait_time
+            await asyncio.sleep(wait_time)
+            return await self.wait()
+        self.calls.append(now)
+        return True
+
+rate_limiter = RateLimiter(max_calls_per_minute=30)
+
+# -------------------------
+# Database
+# -------------------------
+async def init_db():
     global _pool
-    if _pool is None:
-        raise RuntimeError("Database pool not initialised")
-    return _pool
-
-
-async def init_db() -> None:
-    global _pool
-    _pool = await asyncpg.create_pool(DATABASE_URL, min_size=1, max_size=5, ssl="require")
-    async with _pool.acquire() as conn:
-        await conn.execute("""
-            CREATE TABLE IF NOT EXISTS watched_addresses (
-                id          SERIAL PRIMARY KEY,
-                user_id     BIGINT NOT NULL,
-                address     TEXT   NOT NULL,
-                added_at    BIGINT NOT NULL,
-                UNIQUE(user_id, address)
-            );
-            CREATE TABLE IF NOT EXISTS user_settings (
-                user_id     BIGINT PRIMARY KEY,
-                language    TEXT NOT NULL DEFAULT 'en'
-            );
-            CREATE TABLE IF NOT EXISTS user_receipt_counter (
-                user_id     BIGINT PRIMARY KEY,
-                counter     INTEGER NOT NULL DEFAULT 0
-            );
-            CREATE TABLE IF NOT EXISTS seen_transactions (
-                txid        TEXT NOT NULL,
-                address     TEXT NOT NULL,
-                PRIMARY KEY (txid, address)
-            );
-        """)
-    logger.info("PostgreSQL database initialised")
-
+    try:
+        _pool = await asyncpg.create_pool(DATABASE_URL, min_size=1, max_size=5)
+        async with _pool.acquire() as conn:
+            await conn.execute("""
+                CREATE TABLE IF NOT EXISTS watched_addresses (
+                    id SERIAL PRIMARY KEY,
+                    user_id BIGINT NOT NULL,
+                    address TEXT NOT NULL,
+                    label TEXT,
+                    added_at BIGINT NOT NULL,
+                    UNIQUE(user_id, address)
+                )
+            """)
+            await conn.execute("""
+                CREATE TABLE IF NOT EXISTS seen_transactions (
+                    txid TEXT NOT NULL,
+                    address TEXT NOT NULL,
+                    user_id BIGINT NOT NULL,
+                    PRIMARY KEY (txid, address, user_id)
+                )
+            """)
+            await conn.execute("""
+                CREATE TABLE IF NOT EXISTS user_settings (
+                    user_id BIGINT PRIMARY KEY,
+                    language TEXT DEFAULT 'en'
+                )
+            """)
+            await conn.execute("""
+                CREATE TABLE IF NOT EXISTS authorized_users (
+                    user_id BIGINT PRIMARY KEY,
+                    added_by BIGINT,
+                    created_at BIGINT NOT NULL
+                )
+            """)
+        logger.info("✅ Database ready")
+    except Exception as e:
+        logger.error(f"Database error: {e}")
+        raise
 
 async def get_user_language(user_id: int) -> str:
-    pool = await get_pool()
-    async with pool.acquire() as conn:
-        row = await conn.fetchrow(
-            "SELECT language FROM user_settings WHERE user_id = $1", user_id
-        )
-        return row["language"] if row else "en"
+    async with _pool.acquire() as conn:
+        row = await conn.fetchrow("SELECT language FROM user_settings WHERE user_id = $1", user_id)
+        return row['language'] if row else 'en'
 
-
-async def set_user_language(user_id: int, lang: str) -> None:
-    pool = await get_pool()
-    async with pool.acquire() as conn:
+async def set_user_language(user_id: int, lang: str):
+    async with _pool.acquire() as conn:
         await conn.execute(
-            "INSERT INTO user_settings (user_id, language) VALUES ($1, $2) "
-            "ON CONFLICT(user_id) DO UPDATE SET language = EXCLUDED.language",
-            user_id, lang,
+            "INSERT INTO user_settings(user_id, language) VALUES ($1, $2) ON CONFLICT(user_id) DO UPDATE SET language=$2",
+            user_id, lang
         )
 
-
-async def get_next_receipt_number(user_id: int) -> int:
-    """Atomically increment and return the per-user receipt counter."""
-    pool = await get_pool()
-    async with pool.acquire() as conn:
-        row = await conn.fetchrow(
-            "INSERT INTO user_receipt_counter (user_id, counter) VALUES ($1, 1) "
-            "ON CONFLICT(user_id) DO UPDATE SET counter = user_receipt_counter.counter + 1 "
-            "RETURNING counter",
-            user_id,
-        )
-        return row["counter"]
-
-
-async def add_address_db(user_id: int, address: str) -> bool:
-    pool = await get_pool()
-    async with pool.acquire() as conn:
-        try:
+async def add_address_to_db(user_id: int, address: str, label: str = "") -> Tuple[bool, str]:
+    try:
+        async with _pool.acquire() as conn:
             await conn.execute(
-                "INSERT INTO watched_addresses (user_id, address, added_at) VALUES ($1, $2, $3)",
-                user_id, address, int(time.time()),
+                "INSERT INTO watched_addresses(user_id, address, label, added_at) VALUES ($1, $2, $3, $4)",
+                user_id, address.strip(), label.strip(), int(time.time())
             )
-            return True
-        except asyncpg.UniqueViolationError:
-            return False
+        return True, "✅ Address added"
+    except asyncpg.UniqueViolationError:
+        return False, "❌ Address already in your watchlist"
 
+async def remove_address_from_db(user_id: int, address_id: int) -> bool:
+    async with _pool.acquire() as conn:
+        result = await conn.execute("DELETE FROM watched_addresses WHERE id = $1 AND user_id = $2", address_id, user_id)
+        return result != "DELETE 0"
 
-async def delete_address_db(user_id: int, address: str) -> None:
-    pool = await get_pool()
-    async with pool.acquire() as conn:
-        await conn.execute(
-            "DELETE FROM watched_addresses WHERE user_id = $1 AND address = $2",
-            user_id, address,
-        )
+async def get_addresses(user_id: int) -> List:
+    async with _pool.acquire() as conn:
+        rows = await conn.fetch("SELECT id, address, label FROM watched_addresses WHERE user_id = $1 ORDER BY id DESC", user_id)
+        return rows
 
-
-async def get_user_addresses(user_id: int) -> list[str]:
-    pool = await get_pool()
-    async with pool.acquire() as conn:
-        rows = await conn.fetch(
-            "SELECT address FROM watched_addresses WHERE user_id = $1 ORDER BY added_at",
-            user_id,
-        )
-        return [row["address"] for row in rows]
-
-
-async def get_all_watched_addresses() -> dict[str, list[int]]:
-    pool = await get_pool()
-    async with pool.acquire() as conn:
-        rows = await conn.fetch("SELECT address, user_id FROM watched_addresses")
-    result: dict[str, list[int]] = {}
-    for row in rows:
-        result.setdefault(row["address"], []).append(row["user_id"])
-    return result
-
-
-async def is_tx_seen(txid: str, address: str) -> bool:
-    pool = await get_pool()
-    async with pool.acquire() as conn:
-        row = await conn.fetchrow(
-            "SELECT 1 FROM seen_transactions WHERE txid = $1 AND address = $2",
-            txid, address,
-        )
+async def is_tx_seen(user_id: int, txid: str, address: str) -> bool:
+    async with _pool.acquire() as conn:
+        row = await conn.fetchrow("SELECT 1 FROM seen_transactions WHERE user_id = $1 AND txid = $2 AND address = $3", user_id, txid, address)
         return row is not None
 
+async def has_seen_transactions_for_address(user_id: int, address: str) -> bool:
+    async with _pool.acquire() as conn:
+        row = await conn.fetchrow("SELECT 1 FROM seen_transactions WHERE user_id = $1 AND address = $2 LIMIT 1", user_id, address)
+        return row is not None
 
-async def mark_tx_seen(txid: str, address: str) -> None:
-    pool = await get_pool()
-    async with pool.acquire() as conn:
+async def mark_tx_seen(user_id: int, txid: str, address: str):
+    async with _pool.acquire() as conn:
         await conn.execute(
-            "INSERT INTO seen_transactions (txid, address) VALUES ($1, $2) ON CONFLICT DO NOTHING",
-            txid, address,
+            "INSERT INTO seen_transactions(user_id, txid, address) VALUES ($1, $2, $3) ON CONFLICT DO NOTHING",
+            user_id, txid, address
         )
 
-
-# ─────────────────────────── HELPERS ──────────────────────────────────────────
-
-DASH_ADDRESS_RE = re.compile(r"^[X7][1-9A-HJ-NP-Za-km-z]{25,34}$")
-
-
-def is_valid_dash_address(address: str) -> bool:
-    return bool(DASH_ADDRESS_RE.match(address.strip()))
-
-
-def t(lang: str, key: str, **kwargs) -> str:
-    text = TEXTS.get(lang, TEXTS["en"]).get(key, key)
-    return text.format(**kwargs) if kwargs else text
-
-
-async def safe_edit(
-    query: CallbackQuery, text: str, reply_markup=None, parse_mode=ParseMode.HTML
-) -> None:
+async def add_authorized_user_to_db(user_id: int, added_by: int) -> bool:
+    if is_super_admin_id(user_id):
+        return False
     try:
-        await query.edit_message_text(text=text, reply_markup=reply_markup, parse_mode=parse_mode)
-    except BadRequest as exc:
-        logger.warning("safe_edit failed (%s), sending new message", exc)
-        await query.message.reply_text(text=text, reply_markup=reply_markup, parse_mode=parse_mode)
+        async with _pool.acquire() as conn:
+            await conn.execute(
+                "INSERT INTO authorized_users(user_id, added_by, created_at) VALUES ($1, $2, $3) ON CONFLICT DO NOTHING",
+                user_id, added_by, int(time.time())
+            )
+        return True
+    except:
+        return False
 
+async def remove_authorized_user_from_db(user_id: int) -> bool:
+    async with _pool.acquire() as conn:
+        result = await conn.execute("DELETE FROM authorized_users WHERE user_id = $1", user_id)
+        return result != "DELETE 0"
 
-# ─────────────────────────── KEYBOARDS ────────────────────────────────────────
+async def is_db_authorized_user(user_id: int) -> bool:
+    async with _pool.acquire() as conn:
+        row = await conn.fetchrow("SELECT 1 FROM authorized_users WHERE user_id = $1", user_id)
+        return row is not None
 
+async def get_authorized_users() -> List:
+    async with _pool.acquire() as conn:
+        rows = await conn.fetch("SELECT user_id, added_by FROM authorized_users ORDER BY created_at DESC")
+        return rows
 
-def build_main_menu(lang: str) -> InlineKeyboardMarkup:
+async def get_all_active_user_ids() -> List[int]:
+    users = set(ADMIN_CHAT_IDS)
+    async with _pool.acquire() as conn:
+        rows = await conn.fetch("SELECT user_id FROM authorized_users")
+        for row in rows:
+            users.add(int(row['user_id']))
+    return sorted(users)
+
+# -------------------------
+# Translations
+# -------------------------
+TRANSLATIONS = {
+    "en": {
+        "unauthorized": "❌ Unauthorized",
+        "start": "🤖 **Dash Deposit Bot Active**\n\n⏱ Scan: every {interval}s\n📊 Watching: {count} address(es)\n⚡ Insight API\n\nUse menu below 👇",
+        "main_menu": "Main Menu:",
+        "add_prompt": "➕ **Add DASH Address**\n\nSend address (starts with X or 7, 34 chars)\n\nOptional label:\n`Xaddress... | My Wallet`",
+        "invalid_address": "❌ Invalid DASH address\nMust start with X or 7, 34 chars",
+        "address_added": "✅ Address added",
+        "already_exists": "❌ Address already in watchlist",
+        "no_addresses": "📭 No addresses",
+        "address_list_header": "📚 **Watched Addresses:**\n",
+        "remove_success": "✅ Removed",
+        "remove_fail": "❌ Not found",
+        "checking": "🔄 Scanning...",
+        "scan_complete": "✅ Scan complete!\n💰 Found: {count} new deposit(s)",
+        "cancel": "Cancelled",
+        "deposit_notification": "💰 **NEW DASH DEPOSIT!** 💰\n\n📥 **Address:** `{address}`{label}\n💵 **Amount:** `{amount:.8f}` DASH\n🕒 **Time:** {time}\n🔗 **TX:** `{txid_short}...`\n🌐 [View]({explorer})",
+        "language_changed": "🌐 Language changed",
+        "choose_language": "🌐 Choose language:",
+        "btn_add_address": "➕ Add Address",
+        "btn_my_addresses": "📚 My Addresses",
+        "btn_check_now": "🔄 Check Now",
+        "btn_language": "🌐 Language",
+        "btn_back": "⬅️ Back",
+        "btn_remove": "❌ Remove #{id}",
+        "btn_authorization": "🛡 Authorization",
+        "btn_authorize_user": "✅ Authorize User",
+        "btn_authorized_users": "👥 Authorized Users",
+        "authorization_menu": "🛡 Authorization Menu:",
+        "authorize_prompt": "Send the user ID to authorize:",
+        "authorize_success": "✅ User {target_id} authorized",
+        "authorize_exists": "❌ User {target_id} already authorized",
+        "authorized_users_empty": "📭 No authorized users",
+        "authorized_users_header": "👥 **Authorized Users:**\n",
+        "btn_remove_user": "❌ Remove {target_id}",
+        "remove_user_success": "✅ User removed",
+        "remove_user_fail": "❌ User not found",
+        "super_admin_only": "❌ Only main admins",
+        "invalid_user_id": "❌ Invalid user ID",
+    },
+    "hy": {
+        "unauthorized": "❌ Մուտքը արգելված է",
+        "start": "🤖 **Dash Deposit Bot-ը ակտիվ է**\n\n⏱ Ստուգում ամեն {interval}վ\n📊 Դիտարկվածներ՝ {count}\n⚡ Insight API\n\nՕգտագործեք մենյուն 👇",
+        "main_menu": "Գլխավոր մենյու:",
+        "add_prompt": "➕ **Ավելացնել DASH հասցե**\n\nՀասցե (սկսվում է X կամ 7, 34 նիշ)",
+        "invalid_address": "❌ Սխալ DASH հասցե",
+        "address_added": "✅ Ավելացված է",
+        "already_exists": "❌ Հասցեն արդեն կա",
+        "no_addresses": "📭 Հասցեներ չկան",
+        "address_list_header": "📚 **Դիտարկվող հասցեներ:**\n",
+        "remove_success": "✅ Հեռացված է",
+        "remove_fail": "❌ Չի գտնվել",
+        "checking": "🔄 Ստուգում...",
+        "scan_complete": "✅ Ստուգումն ավարտվել է!\n💰 Գտնված՝ {count}",
+        "cancel": "Չեղարկված",
+        "deposit_notification": "💰 **ՆՈՐ DASH ՄՈՒՏՔ!** 💰\n\n📥 **Հասցե՝** `{address}`{label}\n💵 **Գումար՝** `{amount:.8f}` DASH\n🕒 **Ժամ՝** {time}\n🔗 **TX՝** `{txid_short}...`",
+        "language_changed": "🌐 Լեզուն փոխված է",
+        "choose_language": "🌐 Ընտրեք լեզուն:",
+        "btn_add_address": "➕ Ավելացնել",
+        "btn_my_addresses": "📚 Իմ հասցեներ",
+        "btn_check_now": "🔄 Ստուգել",
+        "btn_language": "🌐 Լեզու",
+        "btn_back": "⬅️ Հետ",
+        "btn_remove": "❌ Հեռացնել #{id}",
+        "btn_authorization": "🛡 Թույլտվություն",
+        "btn_authorize_user": "✅ Թույլատրել",
+        "btn_authorized_users": "👥 Թույլատրված",
+        "authorization_menu": "🛡 Թույլտվություն:",
+        "authorize_prompt": "User ID-ն ուղարկեք:",
+        "authorize_success": "✅ Թույլատրված է {target_id}",
+        "authorize_exists": "❌ {target_id} արդեն թույլատրված է",
+        "authorized_users_empty": "📭 Չկան",
+        "authorized_users_header": "👥 **Թույլատրված:**\n",
+        "btn_remove_user": "❌ Հեռացնել {target_id}",
+        "remove_user_success": "✅ Հեռացված է",
+        "remove_user_fail": "❌ Չի գտնվել",
+        "super_admin_only": "❌ Միայն ադմիններ",
+        "invalid_user_id": "❌ Սխալ ID",
+    }
+}
+
+async def _(user_id: int, key: str, **kwargs) -> str:
+    lang = await get_user_language(user_id)
+    text = TRANSLATIONS.get(lang, TRANSLATIONS["en"]).get(key, key)
+    if kwargs:
+        text = text.format(**kwargs)
+    return text
+
+# -------------------------
+# API helpers
+# -------------------------
+async def fetch_json(url: str) -> Optional[dict]:
+    await rate_limiter.wait()
+    try:
+        headers = {'User-Agent': 'Mozilla/5.0'}
+        async with aiohttp.ClientSession() as session:
+            async with session.get(url, timeout=aiohttp.ClientTimeout(total=15), headers=headers) as resp:
+                if resp.status == 200:
+                    return await resp.json()
+                else:
+                    logger.debug(f"API {resp.status}: {url[:50]}")
+                    return None
+    except Exception as e:
+        logger.error(f"Request error: {e}")
+        return None
+
+async def check_address_for_deposits(user_id: int, address: str) -> List[dict]:
+    deposits = []
+    url = INSIGHT_ADDR_API.format(address=address)
+    data = await fetch_json(url)
+    if not data:
+        return deposits
+
+    confirmed_txs = data.get('transactions', [])
+    for txid in confirmed_txs[:20]:
+        if await is_tx_seen(user_id, txid, address):
+            continue
+
+        tx_url = INSIGHT_TX_API.format(txid=txid)
+        tx_data = await fetch_json(tx_url)
+        if not tx_data:
+            await mark_tx_seen(user_id, txid, address)
+            continue
+
+        received_value = 0.0
+        for vout in tx_data.get('vout', []):
+            addresses = vout.get('scriptPubKey', {}).get('addresses', [])
+            if address in addresses:
+                value = vout.get('value')
+                if value is not None:
+                    try:
+                        received_value += float(value)
+                    except (ValueError, TypeError):
+                        pass
+
+        if received_value > 0:
+            tx_time = tx_data.get('time', 0)
+            if tx_time:
+                dt = datetime.fromtimestamp(tx_time, tz=timezone.utc)
+                local_dt = dt + timedelta(hours=TZ_OFFSET_HOURS)
+                time_str = local_dt.strftime('%Y-%m-%d %H:%M:%S')
+            else:
+                time_str = "Just now"
+                tx_time = int(time.time())
+            
+            deposits.append({
+                'txid': txid,
+                'amount': received_value,
+                'time_str': time_str,
+                'timestamp': tx_time
+            })
+            logger.info(f"💰 Found deposit: {received_value:.8f} DASH to {address[:16]}...")
+        else:
+            await mark_tx_seen(user_id, txid, address)
+    
+    return deposits
+
+# -------------------------
+# Helper functions
+# -------------------------
+def validate_dash_address(address: str) -> bool:
+    return address and (address.startswith('X') or address.startswith('7')) and 33 <= len(address) <= 35
+
+def is_super_admin_id(user_id: int) -> bool:
+    return user_id in ADMIN_CHAT_IDS
+
+async def is_admin(update: Update) -> bool:
+    user = update.effective_user
+    if not user:
+        return False
+    return is_super_admin_id(user.id) or await is_db_authorized_user(user.id)
+
+def parse_add_input(text: str) -> Tuple[str, str]:
+    text = text.strip()
+    if "|" in text:
+        address, label = text.split("|", 1)
+        return address.strip(), label.strip()
+    return text, ""
+
+def parse_user_id_input(text: str) -> Optional[int]:
+    text = (text or "").strip()
+    if text.isdigit():
+        return int(text)
+    return None
+
+async def build_main_menu(user_id: int) -> InlineKeyboardMarkup:
+    rows = [
+        [InlineKeyboardButton(await _(user_id, "btn_add_address"), callback_data="add")],
+        [InlineKeyboardButton(await _(user_id, "btn_my_addresses"), callback_data="list")],
+        [InlineKeyboardButton(await _(user_id, "btn_check_now"), callback_data="check_now")],
+        [InlineKeyboardButton(await _(user_id, "btn_language"), callback_data="language")],
+    ]
+    if is_super_admin_id(user_id):
+        rows.append([InlineKeyboardButton(await _(user_id, "btn_authorization"), callback_data="auth_panel")])
+    return InlineKeyboardMarkup(rows)
+
+async def build_auth_menu(user_id: int) -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup([
-        [InlineKeyboardButton(t(lang, "menu_add"), callback_data="add_address")],
-        [InlineKeyboardButton(t(lang, "menu_list"), callback_data="my_addresses")],
-        [InlineKeyboardButton(t(lang, "menu_delete"), callback_data="delete_address")],
-        [InlineKeyboardButton(t(lang, "menu_lang"), callback_data="change_lang")],
+        [InlineKeyboardButton(await _(user_id, "btn_authorize_user"), callback_data="auth_add")],
+        [InlineKeyboardButton(await _(user_id, "btn_authorized_users"), callback_data="auth_list")],
+        [InlineKeyboardButton(await _(user_id, "btn_back"), callback_data="back_main")],
     ])
 
-
-def build_language_menu(lang: str) -> InlineKeyboardMarkup:
+async def build_language_menu(user_id: int) -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup([
-        [
-            InlineKeyboardButton(t(lang, "lang_en"), callback_data="set_lang_en"),
-            InlineKeyboardButton(t(lang, "lang_hy"), callback_data="set_lang_hy"),
-        ],
-        [InlineKeyboardButton(t(lang, "back"), callback_data="main_menu")],
+        [InlineKeyboardButton("🇬🇧 English", callback_data="lang_en")],
+        [InlineKeyboardButton("🇦🇲 Հայերեն", callback_data="lang_hy")],
+        [InlineKeyboardButton(await _(user_id, "btn_back"), callback_data="back_main")],
     ])
 
+# -------------------------
+# Telegram Handlers
+# -------------------------
+async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    user = update.effective_user
+    if not user or not await is_admin(update):
+        await update.message.reply_text("❌ Unauthorized")
+        return
+    
+    user_id = user.id
+    addresses = await get_addresses(user_id)
+    count = len(addresses)
+    text = await _(user_id, "start", interval=CHECK_INTERVAL_SECONDS, count=count)
+    await update.message.reply_text(text, reply_markup=await build_main_menu(user_id), parse_mode='Markdown')
 
-def build_back_button(lang: str) -> InlineKeyboardMarkup:
-    return InlineKeyboardMarkup(
-        [[InlineKeyboardButton(t(lang, "back"), callback_data="main_menu")]]
-    )
+async def menu(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    user = update.effective_user
+    if not user or not await is_admin(update):
+        await update.message.reply_text("❌ Unauthorized")
+        return
+    
+    text = await _(user.id, "main_menu")
+    await update.message.reply_text(text, reply_markup=await build_main_menu(user.id))
 
-
-def build_delete_list(addresses: list[str], lang: str) -> InlineKeyboardMarkup:
-    """One button per address showing shortened form, plus Back button."""
-    buttons = []
-    for addr in addresses:
-        short = f"{addr[:8]}...{addr[-6:]}"
-        buttons.append([InlineKeyboardButton(f"🗑 {short}", callback_data=f"del_confirm:{addr}")])
-    buttons.append([InlineKeyboardButton(t(lang, "back"), callback_data="main_menu")])
-    return InlineKeyboardMarkup(buttons)
-
-
-def build_delete_confirm(address: str, lang: str) -> InlineKeyboardMarkup:
-    return InlineKeyboardMarkup([[
-        InlineKeyboardButton(t(lang, "delete_yes"), callback_data=f"del_do:{address}"),
-        InlineKeyboardButton(t(lang, "delete_no"), callback_data="delete_address"),
-    ]])
-
-
-# ─────────────────────────── COMMAND HANDLERS ─────────────────────────────────
-
-
-async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    user_id = update.effective_user.id
-    lang = await get_user_language(user_id)
-    await update.message.reply_text(
-        text=t(lang, "welcome"),
-        reply_markup=build_main_menu(lang),
-        parse_mode=ParseMode.HTML,
-    )
-
-
-async def cmd_cancel(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-    user_id = update.effective_user.id
-    lang = await get_user_language(user_id)
-    await update.message.reply_text(
-        text=t(lang, "cancel"),
-        reply_markup=build_main_menu(lang),
-        parse_mode=ParseMode.HTML,
-    )
-    return ConversationHandler.END
-
-
-# ─────────────────────────── CALLBACK HANDLERS ────────────────────────────────
-
-
-async def panel_click(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Central dispatcher for all inline button clicks outside ConversationHandler."""
+async def panel_click(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await query.answer()
-    user_id = query.from_user.id
-    lang = await get_user_language(user_id)
+    user = update.effective_user
+    if not user or not await is_admin(update):
+        await query.edit_message_text("❌ Unauthorized")
+        return
+    
+    user_id = user.id
     data = query.data
 
-    if data == "main_menu":
-        await safe_edit(query, t(lang, "welcome"), reply_markup=build_main_menu(lang))
+    if data == "add":
+        text = await _(user_id, "add_prompt")
+        await query.edit_message_text(text, parse_mode='Markdown')
+        return ADD_ADDRESS
 
-    elif data == "my_addresses":
-        addresses = await get_user_addresses(user_id)
-        if not addresses:
-            text = t(lang, "no_addresses")
-        else:
-            lines = [t(lang, "addresses_header")]
-            for i, addr in enumerate(addresses, 1):
-                lines.append(f"{i}. <code>{addr}</code>")
-            text = "\n".join(lines)
-        await safe_edit(query, text, reply_markup=build_back_button(lang))
+    if data == "list":
+        rows = await get_addresses(user_id)
+        if not rows:
+            text = await _(user_id, "no_addresses")
+            await query.edit_message_text(text, reply_markup=await build_main_menu(user_id))
+            return
+        
+        header = await _(user_id, "address_list_header")
+        lines = [header]
+        keyboard = []
+        for row in rows:
+            label = f" - {row['label']}" if row['label'] else ""
+            lines.append(f"`{row['id']}. {row['address']}`{label}")
+            remove_text = await _(user_id, "btn_remove", id=row['id'])
+            keyboard.append([InlineKeyboardButton(remove_text, callback_data=f"remove:{row['id']}")])
+        
+        back_text = await _(user_id, "btn_back")
+        keyboard.append([InlineKeyboardButton(back_text, callback_data="back_main")])
+        await query.edit_message_text("\n".join(lines), reply_markup=InlineKeyboardMarkup(keyboard), parse_mode='Markdown')
+        return
 
-    elif data == "change_lang":
-        await safe_edit(query, t(lang, "choose_lang"), reply_markup=build_language_menu(lang))
+    if data.startswith("remove:"):
+        addr_id = int(data.split(":", 1)[1])
+        success = await remove_address_from_db(user_id, addr_id)
+        msg_key = "remove_success" if success else "remove_fail"
+        text = await _(user_id, msg_key)
+        await query.edit_message_text(text, reply_markup=await build_main_menu(user_id))
+        return
 
-    elif data == "set_lang_en":
-        await set_user_language(user_id, "en")
-        lang = "en"
-        await safe_edit(query, t(lang, "lang_set"), reply_markup=build_main_menu(lang))
-
-    elif data == "set_lang_hy":
-        await set_user_language(user_id, "hy")
-        lang = "hy"
-        await safe_edit(query, t(lang, "lang_set"), reply_markup=build_main_menu(lang))
-
-    elif data == "delete_address":
-        addresses = await get_user_addresses(user_id)
-        if not addresses:
-            await safe_edit(query, t(lang, "delete_no_addresses"), reply_markup=build_back_button(lang))
-        else:
-            await safe_edit(query, t(lang, "delete_choose"), reply_markup=build_delete_list(addresses, lang))
-
-    elif data.startswith("del_confirm:"):
-        address = data.split(":", 1)[1]
-        await safe_edit(
-            query,
-            t(lang, "delete_confirm", address=address),
-            reply_markup=build_delete_confirm(address, lang),
+    if data == "check_now":
+        checking_text = await _(user_id, "checking")
+        await query.edit_message_text(checking_text)
+        count = await check_all_addresses_for_user(user_id, context)
+        complete_text = await _(user_id, "scan_complete", count=count)
+        await context.bot.send_message(
+            chat_id=user_id,
+            text=complete_text,
+            reply_markup=await build_main_menu(user_id)
         )
+        return
 
-    elif data.startswith("del_do:"):
-        address = data.split(":", 1)[1]
-        await delete_address_db(user_id, address)
-        logger.info("User %d deleted address %s", user_id, address)
-        await safe_edit(
-            query,
-            t(lang, "delete_done", address=address),
-            reply_markup=build_main_menu(lang),
-        )
+    if data == "language":
+        text = await _(user_id, "choose_language")
+        await query.edit_message_text(text, reply_markup=await build_language_menu(user_id))
+        return
 
+    if data.startswith("lang_"):
+        lang = data.split("_")[1]
+        await set_user_language(user_id, lang)
+        text = await _(user_id, "language_changed")
+        await query.edit_message_text(text, reply_markup=await build_main_menu(user_id))
+        return
 
-# ─────────────────────────── CONVERSATION: ADD ADDRESS ────────────────────────
+    if data == "auth_panel":
+        if not is_super_admin_id(user_id):
+            text = await _(user_id, "super_admin_only")
+            await query.edit_message_text(text, reply_markup=await build_main_menu(user_id))
+            return
+        text = await _(user_id, "authorization_menu")
+        await query.edit_message_text(text, reply_markup=await build_auth_menu(user_id))
+        return
 
+    if data == "auth_add":
+        if not is_super_admin_id(user_id):
+            text = await _(user_id, "super_admin_only")
+            await query.edit_message_text(text, reply_markup=await build_main_menu(user_id))
+            return
+        text = await _(user_id, "authorize_prompt")
+        await query.edit_message_text(text)
+        return AUTHORIZE_USER
 
-async def add_address_entry(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-    query = update.callback_query
-    await query.answer()
-    user_id = query.from_user.id
-    lang = await get_user_language(user_id)
-    await safe_edit(query, t(lang, "ask_address"))
-    return WAITING_ADDRESS
+    if data == "auth_list":
+        if not is_super_admin_id(user_id):
+            text = await _(user_id, "super_admin_only")
+            await query.edit_message_text(text, reply_markup=await build_main_menu(user_id))
+            return
+        
+        rows = await get_authorized_users()
+        if not rows:
+            text = await _(user_id, "authorized_users_empty")
+            await query.edit_message_text(text, reply_markup=await build_auth_menu(user_id))
+            return
+        
+        header = await _(user_id, "authorized_users_header")
+        lines = [header]
+        keyboard = []
+        for row in rows:
+            lines.append(f"`{row['user_id']}`")
+            remove_text = await _(user_id, "btn_remove_user", target_id=row['user_id'])
+            keyboard.append([InlineKeyboardButton(remove_text, callback_data=f"auth_remove:{row['user_id']}")])
+        
+        back_text = await _(user_id, "btn_back")
+        keyboard.append([InlineKeyboardButton(back_text, callback_data="auth_panel")])
+        await query.edit_message_text("\n".join(lines), reply_markup=InlineKeyboardMarkup(keyboard), parse_mode='Markdown')
+        return
 
+    if data.startswith("auth_remove:"):
+        if not is_super_admin_id(user_id):
+            text = await _(user_id, "super_admin_only")
+            await query.edit_message_text(text, reply_markup=await build_main_menu(user_id))
+            return
+        
+        target_user_id = int(data.split(":", 1)[1])
+        success = await remove_authorized_user_from_db(target_user_id)
+        msg_key = "remove_user_success" if success else "remove_user_fail"
+        text = await _(user_id, msg_key)
+        await query.edit_message_text(text, reply_markup=await build_auth_menu(user_id))
+        return
 
-async def add_address(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-    user_id = update.effective_user.id
-    lang = await get_user_language(user_id)
-    raw = update.message.text.strip()
+    if data == "back_main":
+        text = await _(user_id, "main_menu")
+        await query.edit_message_text(text, reply_markup=await build_main_menu(user_id))
+        return
 
-    if not is_valid_dash_address(raw):
-        await update.message.reply_text(t(lang, "invalid_address"), parse_mode=ParseMode.HTML)
-        return WAITING_ADDRESS
-
-    inserted = await add_address_db(user_id, raw)
-    msg = t(lang, "address_saved", address=raw) if inserted else t(lang, "address_exists", address=raw)
-    await update.message.reply_text(msg, reply_markup=build_main_menu(lang), parse_mode=ParseMode.HTML)
+async def add_address_received(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    user = update.effective_user
+    if not user or not await is_admin(update):
+        await update.message.reply_text("❌ Unauthorized")
+        return ConversationHandler.END
+    
+    user_id = user.id
+    text = update.message.text.strip()
+    address, label = parse_add_input(text)
+    
+    if not address or not validate_dash_address(address):
+        invalid_text = await _(user_id, "invalid_address")
+        await update.message.reply_text(invalid_text)
+        return ADD_ADDRESS
+    
+    success, msg = await add_address_to_db(user_id, address, label)
+    reply_msg = msg
+    await update.message.reply_text(reply_msg, reply_markup=await build_main_menu(user_id))
     return ConversationHandler.END
 
-
-# ─────────────────────────── DEPOSIT NOTIFICATION ─────────────────────────────
-
-
-async def notify_deposit(
-    bot: Bot,
-    user_id: int,
-    address: str,
-    amount: float,
-    txid: str,
-    price_usd: Optional[float] = None,
-    tx_time: Optional[int] = None,
-    senders: Optional[list[str]] = None,
-    is_unconfirmed: bool = False,
-) -> None:
-    receipt_number = await get_next_receipt_number(user_id)
-    lang = await get_user_language(user_id)
-
-    amount_usd = dash_to_usd(amount, price_usd)
-    amount_dash = f"{amount:.8f}"
-    rate = f"${price_usd:,.2f}" if price_usd is not None else "N/A"
-
-    ts = tx_time if tx_time else int(time.time())
-    dt = datetime.fromtimestamp(ts, tz=timezone.utc)
-    timestamp = dt.strftime("%Y-%m-%d %H:%M:%S UTC")
-
-    tx_url = f"https://insight.dash.org/insight/tx/{txid}"
-    txid_short = txid[:8]
-    txid_tail = txid[-8:]
-
-    # Badge shown next to title for unconfirmed mempool transactions
-    unconfirmed_badge = "  <i>(unconfirmed)</i>" if is_unconfirmed else ""
-
-    if senders:
-        senders_text = f"<code>{senders[0]}</code>" if len(senders) == 1 else \
-            "\n" + "\n".join(f"<code>{s}</code>" for s in senders)
-    else:
-        senders_text = "<i>unknown</i>"
-
-    text = t(
-        lang, "deposit_notify",
-        receipt_number=receipt_number,
-        timestamp=timestamp,
-        unconfirmed_badge=unconfirmed_badge,
-        senders_text=senders_text,
-        address=address,
-        amount_usd=amount_usd,
-        amount_dash=amount_dash,
-        rate=rate,
-        txid=txid,
-        tx_url=tx_url,
-        txid_short=txid_short,
-        txid_tail=txid_tail,
-    )
-    try:
-        await bot.send_message(chat_id=user_id, text=text, parse_mode=ParseMode.HTML)
-        logger.info(
-            "Notified user %d | Receipt #%d | %s DASH ≈ %s | %s | unconfirmed=%s | %s",
-            user_id, receipt_number, amount_dash, amount_usd, timestamp, is_unconfirmed, txid,
-        )
-    except TelegramError as exc:
-        logger.error("Failed to notify user %d: %s", user_id, exc)
-
-
-# ─────────────────────────── DASH BLOCKCHAIN POLLER ───────────────────────────
-
-
-async def fetch_address_txs(session: aiohttp.ClientSession, address: str) -> list[dict]:
-    """
-    Fetch transactions from multiple blockchain APIs with intelligent fallback.
-    - Uses health tracker to determine best API
-    - Automatically switches to fallback on rate limit or error
-    - Recovers blocked APIs after timeout period
-    """
-    # Try best API first, then fallback to others
-    best_api = _api_health.get_best_api()
-    api_order = []
+async def authorize_user_received(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    user = update.effective_user
+    if not user or not is_super_admin_id(user.id):
+        await update.message.reply_text("❌ Unauthorized")
+        return ConversationHandler.END
     
-    if best_api:
-        api_order.append(best_api)
-        api_order.extend([a["name"] for a in BLOCKCHAIN_APIS if a["name"] != best_api])
+    user_id = user.id
+    text = update.message.text.strip()
+    target_user_id = parse_user_id_input(text)
+    
+    if not target_user_id:
+        invalid_text = await _(user_id, "invalid_user_id")
+        await update.message.reply_text(invalid_text, reply_markup=await build_auth_menu(user_id))
+        return AUTHORIZE_USER
+    
+    added = await add_authorized_user_to_db(target_user_id, user_id)
+    key = "authorize_success" if added else "authorize_exists"
+    msg_text = await _(user_id, key, target_id=target_user_id)
+    await update.message.reply_text(msg_text, reply_markup=await build_auth_menu(user_id), parse_mode="Markdown")
+    return ConversationHandler.END
+
+async def cancel(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    user = update.effective_user
+    if user and await is_admin(update):
+        cancel_text = await _(user.id, "cancel")
+        await update.message.reply_text(cancel_text, reply_markup=await build_main_menu(user.id))
     else:
-        api_order = [a["name"] for a in BLOCKCHAIN_APIS]
+        await update.message.reply_text("Cancelled")
+    return ConversationHandler.END
 
-    for api_name in api_order:
-        if not _api_health.is_available(api_name):
-            logger.info(f"Skipping {api_name} (rate limited, will recover soon)")
-            continue
+async def notify_deposit(user_id: int, context: ContextTypes.DEFAULT_TYPE, address: str, label: str, txid: str, amount: float, time_str: str):
+    label_text = f"\n🏷 **Label:** {label}" if label else ""
+    explorer_link = EXPLORER_TX_URL.format(txid=txid)
+    txid_short = txid[:16]
+    
+    msg = await _(user_id, "deposit_notification",
+                  address=address,
+                  label=label_text,
+                  amount=amount,
+                  time=time_str,
+                  txid_short=txid_short,
+                  explorer=explorer_link)
+    
+    await context.bot.send_message(chat_id=user_id, text=msg, parse_mode='Markdown', disable_web_page_preview=True)
 
-        try:
-            if api_name == "Insight":
+async def check_single_address_for_user(user_id: int, address: str, label: str, context: ContextTypes.DEFAULT_TYPE) -> int:
+    deposits = await check_address_for_deposits(user_id, address)
+    for d in deposits:
+        await mark_tx_seen(user_id, d['txid'], address)
+        await notify_deposit(user_id, context, address, label, d['txid'], d['amount'], d['time_str'])
+    return len(deposits)
+
+async def check_all_addresses_for_user(user_id: int, context: ContextTypes.DEFAULT_TYPE) -> int:
+    lock = get_user_scan_lock(user_id)
+
+    if lock.locked():
+        logger.info(f"⏭ Skipping scan for user {user_id}, previous scan still running")
+        return 0
+
+    async with lock:
+        rows = await get_addresses(user_id)
+        if not rows:
+            return 0
+        
+        logger.info(f"🔍 Checking {len(rows)} addresses for user {user_id}")
+        total = 0
+        for i, row in enumerate(rows):
+            address = row['address']
+            label = row['label'] or ""
+
+            logger.info(f"📌 [{i+1}/{len(rows)}] {address[:16]}...")
+
+            if not await has_seen_transactions_for_address(user_id, address):
+                logger.info(f"🛡 Seeding old transactions for {address[:16]}...")
+                # Just mark first 20 as seen
                 url = INSIGHT_ADDR_API.format(address=address)
-                async with session.get(url, timeout=aiohttp.ClientTimeout(total=15)) as resp:
-                    if resp.status == 429:
-                        _api_health.mark_ratelimit("Insight")
-                        logger.warning("Insight rate limited (30 req/min)")
-                        continue
-                    if resp.status != 200:
-                        _api_health.mark_fail("Insight")
-                        logger.warning(f"Insight {resp.status}")
-                        continue
-                    
-                    try:
-                        data = await resp.json()
-                        
-                        # Insight returns address object with transactions array
-                        txs = data.get("transactions", []) if isinstance(data, dict) else []
-                        
-                        for tx in txs:
-                            tx["_source"] = "Insight"
-                        
-                        _api_health.mark_success("Insight")
-                        logger.info(f"✓ Insight: {len(txs)} txs")
-                        return txs
-                    except Exception as e:
-                        _api_health.mark_fail("Insight")
-                        logger.warning(f"Insight parse error: {e}")
-                        continue
+                data = await fetch_json(url)
+                if data:
+                    for txid in data.get('transactions', [])[:20]:
+                        await mark_tx_seen(user_id, txid, address)
+                if i < len(rows)-1:
+                    await asyncio.sleep(1)
+                continue
 
-        except asyncio.TimeoutError:
-            _api_health.mark_fail("Insight")
-            logger.warning("Insight timeout")
-            continue
-        except Exception as exc:
-            _api_health.mark_fail("Insight")
-            logger.error(f"Insight error: {exc}")
-            continue
-
-    logger.error(f"⚠ All APIs failed for {address[:16]}...")
-    return []
-
-
-def parse_blockchair_txs(addr_data: dict, watched_address: str) -> list[dict]:
-    """Convert Blockchair API response to BlockCypher-like format."""
-    converted = []
-    txs = addr_data.get("transactions", [])
-    if not isinstance(txs, list):
-        return []
-    
-    for tx in txs:
-        if not isinstance(tx, dict):
-            continue
-        normalized = {
-            "hash": tx.get("hash"),
-            "time": tx.get("time"),
-            "received": tx.get("time"),
-            "inputs": [],
-            "outputs": [],
-            "_source": "Blockchair",
-        }
-        # Parse inputs/outputs from Blockchair format
-        for inp in tx.get("inputs", []):
-            if isinstance(inp, dict):
-                normalized["inputs"].append({
-                    "addresses": [inp.get("recipient")] if inp.get("recipient") else [],
-                    "output_value": inp.get("value", 0),
-                })
-        for out in tx.get("outputs", []):
-            if isinstance(out, dict):
-                normalized["outputs"].append({
-                    "addresses": [out.get("recipient")] if out.get("recipient") else [],
-                    "value": out.get("value", 0),
-                })
-        if normalized["hash"]:
-            converted.append(normalized)
-    return converted
-
-
-def parse_chainz_txs(data: list, watched_address: str) -> list[dict]:
-    """Convert Chainz API response to BlockCypher-like format."""
-    if not isinstance(data, list):
-        return []
-    
-    converted = []
-    for tx in data:
-        if not isinstance(tx, dict):
-            continue
-        normalized = {
-            "hash": tx.get("txid"),
-            "time": tx.get("time"),
-            "received": tx.get("time"),
-            "confirmations": tx.get("confirmations", 0),
-            "inputs": [],
-            "outputs": [],
-            "_source": "Chainz",
-        }
+            found = await check_single_address_for_user(user_id, address, label, context)
+            total += found
+            if found:
+                logger.info(f"✨ Found {found} deposit(s) for user {user_id}")
+            if i < len(rows)-1:
+                await asyncio.sleep(3)
         
-        # Parse inputs - Chainz format uses "addr" field
-        for vin in tx.get("vin", []):
-            if isinstance(vin, dict):
-                normalized["inputs"].append({
-                    "addresses": [vin["addr"]] if "addr" in vin else [],
-                    "address": vin.get("addr"),
-                })
-        
-        # Parse outputs - Chainz format
-        for vout in tx.get("vout", []):
-            if isinstance(vout, dict):
-                addresses = []
-                if "addresses" in vout and isinstance(vout["addresses"], list):
-                    addresses = vout["addresses"]
-                elif "address" in vout:
-                    addresses = [vout["address"]]
-                
-                normalized["outputs"].append({
-                    "addresses": addresses,
-                    "address": addresses[0] if addresses else None,
-                    "value": vout.get("value", 0),
-                })
-        
-        if normalized["hash"]:
-            converted.append(normalized)
-    return converted
+        return total
 
+async def periodic_check(context: ContextTypes.DEFAULT_TYPE):
+    for admin_id in await get_all_active_user_ids():
+        try:
+            logger.info(f"🔍 Running scheduled scan for user {admin_id}")
+            start = time.time()
+            count = await check_all_addresses_for_user(admin_id, context)
+            logger.info(f"✅ Scan for {admin_id}: {count} deposit(s) found ({time.time()-start:.1f}s)")
+        except Exception as e:
+            logger.error(f"Scan error for user {admin_id}: {e}", exc_info=True)
 
-def extract_tx_info(tx: dict, address: str) -> Optional[tuple[float, list[str], bool]]:
-    """
-    Extract received amount and senders from a blockchain transaction.
-    Send ALL transactions (confirmed and unconfirmed) regardless of amount.
-    Returns (amount_dash, [sender, ...], is_unconfirmed) or None if not our address.
-    """
-    # Normalize formats: BlockCypher uses inputs/outputs
-    inputs = tx.get("inputs", [])
-    outputs = tx.get("outputs", [])
-    
-    # ── Check if address is in outputs (receiving) ───────────────────────────
-    total_satoshis = 0
-    found_in_outputs = False
-    
-    for output in outputs:
-        addresses = output.get("addresses", [])
-        if not addresses and "address" in output:
-            addresses = [output["address"]]
-        
-        if address in addresses:
-            found_in_outputs = True
-            try:
-                total_satoshis += int(output.get("value", 0))
-            except (TypeError, ValueError):
-                pass
-    
-    # If address not in outputs, skip this tx
-    if not found_in_outputs:
-        return None
-    
-    # Convert to DASH (even if 0, we still send it)
-    amount_dash = total_satoshis / 100_000_000
+# -------------------------
+# MAIN
+# -------------------------
+async def main():
+    if not BOT_TOKEN:
+        raise ValueError("BOT_TOKEN missing")
+    if not DATABASE_URL:
+        raise ValueError("DATABASE_URL missing")
+    if not ADMIN_CHAT_IDS:
+        raise ValueError("ADMIN_CHAT_IDS missing")
 
-    # ── Extract sender addresses ─────────────────────────────────────────────
-    seen: set[str] = set()
-    senders: list[str] = []
-    for inp in inputs:
-        addresses = inp.get("addresses", [])
-        if not addresses and "address" in inp:
-            addresses = [inp["address"]]
-        
-        for addr in addresses:
-            if addr and addr != address and addr not in seen:
-                seen.add(addr)
-                senders.append(addr)
+    await init_db()
 
-    # Check if unconfirmed
-    confirmations = tx.get("confirmations", 0)
-    is_unconfirmed = confirmations == 0
-    
-    return amount_dash, senders, is_unconfirmed
+    app = ApplicationBuilder().token(BOT_TOKEN).build()
 
-
-async def blockchain_poller(bot: Bot) -> None:
-    """
-    Background task: checks all watched addresses for new incoming transactions.
-    Notifies immediately for unconfirmed (mempool) txs for fastest alerts,
-    then again once confirmed if needed.
-    """
-    logger.info("Blockchain poller started (interval: %ds)", POLLING_INTERVAL)
-    async with aiohttp.ClientSession() as session:
-        while True:
-            try:
-                price_usd = await get_dash_usd_price(session)
-                watched = await get_all_watched_addresses()
-
-                for address, user_ids in watched.items():
-                    txs = await fetch_address_txs(session, address)
-                    logger.debug(f"Found {len(txs)} txs for {address[:16]}...")
-                    
-                    for tx in txs:
-                        txid = tx.get("hash", "")
-                        if not txid:
-                            logger.debug(f"Skipping tx without hash")
-                            continue
-                        if await is_tx_seen(txid, address):
-                            logger.debug(f"Already seen {txid[:16]}...")
-                            continue
-                        
-                        # Extract info (may return None if not receiving, but log it)
-                        info = extract_tx_info(tx, address)
-                        if info is None:
-                            logger.debug(f"extract_tx_info returned None for {txid[:16]}... (not receiving?)")
-                            continue
-                        
-                        amount, senders, is_unconfirmed = info
-                        logger.info(f"📥 New tx: {amount:.8f} DASH (unconfirmed={is_unconfirmed})")
-                        await mark_tx_seen(txid, address)
-
-                        # Parse timestamp
-                        tx_time = None
-                        raw_time = tx.get("received") if is_unconfirmed else (
-                            tx.get("confirmed") or tx.get("received")
-                        )
-                        if raw_time:
-                            try:
-                                dt = datetime.fromisoformat(raw_time.replace("Z", "+00:00"))
-                                tx_time = int(dt.timestamp())
-                            except Exception:
-                                pass
-
-                        for user_id in user_ids:
-                            logger.info(f"💬 Sending receipt to user {user_id}")
-                            await notify_deposit(
-                                bot=bot,
-                                user_id=user_id,
-                                address=address,
-                                amount=amount,
-                                txid=txid,
-                                price_usd=price_usd,
-                                tx_time=tx_time,
-                                senders=senders,
-                                is_unconfirmed=is_unconfirmed,
-                            )
-                    
-                    # Wait between address checks to spread load
-                    await asyncio.sleep(2)
-
-            except Exception as exc:
-                logger.exception("Poller error: %s", exc)
-            await asyncio.sleep(POLLING_INTERVAL)
-
-
-# ─────────────────────────── APPLICATION SETUP ────────────────────────────────
-
-
-def build_application() -> Application:
-    application = Application.builder().token(BOT_TOKEN).build()
-
-    conv_handler = ConversationHandler(
+    conv = ConversationHandler(
         entry_points=[
-            CallbackQueryHandler(add_address_entry, pattern="^add_address$"),
+            CallbackQueryHandler(panel_click, pattern="^add$"),
+            CallbackQueryHandler(panel_click, pattern="^auth_add$"),
         ],
         states={
-            WAITING_ADDRESS: [
-                MessageHandler(filters.TEXT & ~filters.COMMAND, add_address),
-            ],
+            ADD_ADDRESS: [MessageHandler(filters.TEXT & ~filters.COMMAND, add_address_received)],
+            AUTHORIZE_USER: [MessageHandler(filters.TEXT & ~filters.COMMAND, authorize_user_received)],
         },
-        fallbacks=[
-            CommandHandler("cancel", cmd_cancel),
-            CommandHandler("start", cmd_start),
-        ],
-        allow_reentry=True,
-        per_user=True,
-        per_chat=True,
+        fallbacks=[CommandHandler("cancel", cancel)],
     )
 
-    # Handles all buttons outside the conversation
-    panel_handler = CallbackQueryHandler(
-        panel_click,
-        pattern=(
-            "^(main_menu|my_addresses|change_lang|set_lang_en|set_lang_hy"
-            "|delete_address|del_confirm:.+|del_do:.+)$"
-        ),
-    )
+    app.add_handler(CommandHandler("start", start))
+    app.add_handler(CommandHandler("menu", menu))
+    app.add_handler(conv)
+    app.add_handler(CallbackQueryHandler(panel_click))
 
-    application.add_handler(CommandHandler("start", cmd_start))
-    application.add_handler(conv_handler)
-    application.add_handler(panel_handler)
+    if app.job_queue:
+        app.job_queue.run_repeating(periodic_check, interval=CHECK_INTERVAL_SECONDS, first=3)
 
-    return application
+    logger.info("=" * 50)
+    logger.info("🚀 Bot Started (Insight API)")
+    logger.info(f"📊 Admins: {ADMIN_CHAT_IDS}")
+    logger.info(f"⏱ Scan every {CHECK_INTERVAL_SECONDS}s")
+    logger.info("=" * 50)
 
-
-# ─────────────────────────── MAIN ─────────────────────────────────────────────
-
-
-async def main() -> None:
-    await init_db()
-    application = build_application()
-
-    async with application:
-        poller_task = asyncio.create_task(
-            blockchain_poller(application.bot),
-            name="blockchain_poller",
-        )
-        logger.info("Starting bot polling ...")
-        await application.start()
-        await application.updater.start_polling(
-            allowed_updates=Update.ALL_TYPES,
-            drop_pending_updates=True,
-        )
+    async with app:
+        await app.start()
+        await app.updater.start_polling()
         try:
             await asyncio.Event().wait()
         except (KeyboardInterrupt, SystemExit):
-            logger.info("Shutdown signal received.")
+            logger.info("Shutdown signal received")
         finally:
-            poller_task.cancel()
-            try:
-                await poller_task
-            except asyncio.CancelledError:
-                pass
-            await application.updater.stop()
-            await application.stop()
             if _pool:
                 await _pool.close()
-                logger.info("Database pool closed.")
-
+                logger.info("Database pool closed")
 
 if __name__ == "__main__":
     asyncio.run(main())
