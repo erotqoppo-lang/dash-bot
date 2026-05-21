@@ -597,16 +597,19 @@ async def periodic_check(context: ContextTypes.DEFAULT_TYPE):
 # -------------------------
 # MAIN
 # -------------------------
-async def main():
+if __name__ == "__main__":
+    import asyncio
+    
     if not BOT_TOKEN:
         raise ValueError("BOT_TOKEN missing")
     if not DATABASE_URL:
         raise ValueError("DATABASE_URL missing")
     if not ADMIN_CHAT_IDS:
         raise ValueError("ADMIN_CHAT_IDS missing")
-
-    await init_db()
-
+    
+    # Initialize DB
+    asyncio.run(init_db())
+    
     app = ApplicationBuilder().token(BOT_TOKEN).build()
 
     conv = ConversationHandler(
@@ -633,8 +636,4 @@ async def main():
     logger.info(f"⏱ Scan every {CHECK_INTERVAL_SECONDS}s")
     logger.info("=" * 50)
 
-    await app.run_polling()
-
-if __name__ == "__main__":
-    import asyncio
-    asyncio.get_event_loop().run_until_complete(main())
+    app.run_polling()
