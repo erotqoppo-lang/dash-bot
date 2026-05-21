@@ -51,12 +51,6 @@ BLOCKCHAIN_APIS = [
         "parse_fn": "parse_chainz",
         "enabled": True,
     },
-    {
-        "name": "Insight",
-        "base_url": "https://insight.dash.org/insight-api",
-        "parse_fn": "parse_insight",
-        "enabled": True,
-    },
 ]
 
 POLLING_INTERVAL = 120  # seconds between blockchain checks (increased from 45)
@@ -78,7 +72,6 @@ class APIHealthTracker:
     def __init__(self):
         self.api_stats: dict[str, dict] = {
             "Chainz": {"success": 0, "fail": 0, "ratelimit": 0, "disabled_until": 0.0},
-            "Insight": {"success": 0, "fail": 0, "ratelimit": 0, "disabled_until": 0.0},
         }
     
     def mark_success(self, api_name: str) -> None:
@@ -707,67 +700,13 @@ async def fetch_address_txs(session: aiohttp.ClientSession, address: str) -> lis
                         logger.warning(f"Chainz error: {e}")
                         continue
 
-            elif api_name == "Insight":
-                url = f"https://insight.dash.org/insight-api/addrs/{address}/txs"
-                async with session.get(url, timeout=aiohttp.ClientTimeout(total=15)) as resp:
-                    if resp.status == 429:
-                        _api_health.mark_ratelimit("Insight")
-                        logger.warning("Insight rate limited")
-                        continue
-                    if resp.status != 200:
-                        _api_health.mark_fail("Insight")
-                        logger.warning(f"Insight {resp.status}")
-                        continue
-                    
-                    try:
-                        data = await resp.json()
-                        txs = data if isinstance(data, list) else []
-                        
-                        converted = []
-                        for tx in txs:
-                            if not isinstance(tx, dict) or "txid" not in tx:
-                                continue
-                            
-                            normalized = {
-                                "hash": tx.get("txid"),
-                                "time": tx.get("time"),
-                                "received": tx.get("time"),
-                                "confirmations": tx.get("confirmations", 0),
-                                "inputs": [],
-                                "outputs": [],
-                                "_source": "Insight",
-                            }
-                            
-                            for vin in tx.get("vin", []):
-                                if isinstance(vin, dict) and "addr" in vin:
-                                    normalized["inputs"].append({"addresses": [vin["addr"]]})
-                            
-                            for vout in tx.get("vout", []):
-                                if isinstance(vout, dict):
-                                    addresses = []
-                                    if "scriptPubKey" in vout and isinstance(vout["scriptPubKey"], dict):
-                                        addresses = vout["scriptPubKey"].get("addresses", [])
-                                    normalized["outputs"].append({"addresses": addresses, "value": vout.get("value", 0)})
-                            
-                            if normalized["hash"]:
-                                converted.append(normalized)
-                        
-                        _api_health.mark_success("Insight")
-                        logger.info(f"✓ Insight: {len(converted)} txs")
-                        return converted
-                    
-                    except Exception as e:
-                        _api_health.mark_fail("Insight")
-                        logger.warning(f"Insight error: {e}")
-                        continue
-
         except asyncio.TimeoutError:
-            _api_health.mark_fail(api_name)
-            logger.warning(f"{api_name} timeout")
+            _api_health.mark_fail("Chainz")
+            logger.warning(f"Chainz timeout")
             continue
         except Exception as exc:
-            _api_health.mark_fail(api_name)
-            logger.error(f"{api_name} error: {exc}")
+            _api_health.mark_fail("Chainz")
+            logger.error(f"Chainz error: {exc}")
             continue
 
     logger.error(f"⚠ All APIs failed for {address[:16]}...")
