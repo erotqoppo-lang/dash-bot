@@ -43,6 +43,10 @@ BLOCKCYPHER_TOKEN = os.environ.get("BLOCKCYPHER_TOKEN", "")
 BLOCKCYPHER_TOKEN_2 = os.environ.get("BLOCKCYPHER_TOKEN_2", "")
 BLOCKCYPHER_TOKEN_3 = os.environ.get("BLOCKCYPHER_TOKEN_3", "")
 
+BLOCKCYPHER_TOKEN = os.environ.get("BLOCKCYPHER_TOKEN", "")
+BLOCKCYPHER_TOKEN_2 = os.environ.get("BLOCKCYPHER_TOKEN_2", "")
+BLOCKCYPHER_TOKEN_3 = os.environ.get("BLOCKCYPHER_TOKEN_3", "")
+
 # Multiple blockchain API sources with automatic fallback
 BLOCKCHAIN_APIS = [
     {
@@ -69,7 +73,7 @@ class APIHealthTracker:
     """Tracks API health and automatically switches to best performing API."""
     def __init__(self):
         self.api_stats: dict[str, dict] = {
-            "BlockCypher": {"success": 0, "fail": 0, "ratelimit": 0},
+            "BlockCypher": {"success": 0, "fail": 0, "ratelimit": 0, "disabled_until": 0.0},
         }
         self.token_idx = 0
     
