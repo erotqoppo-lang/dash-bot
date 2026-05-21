@@ -67,6 +67,12 @@ def init_db():
                 language TEXT DEFAULT 'en'
             )
         """)
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS user_receipt_counter (
+                user_id INTEGER PRIMARY KEY,
+                counter INTEGER DEFAULT 0
+            )
+        """)
         conn.commit()
     logger.info("✅ Database ready")
 
@@ -109,9 +115,29 @@ def mark_tx_seen(user_id: int, txid: str, address: str):
         conn.execute("INSERT OR IGNORE INTO seen_transactions(user_id, txid, address) VALUES (?, ?, ?)", (user_id, txid, address))
         conn.commit()
 
-def has_seen_transactions_for_address(user_id: int, address: str) -> bool:
+def get_dash_price_usd() -> float:
+    try:
+        url = "https://api.coingecko.com/api/v3/simple/price?ids=dash&vs_currencies=usd"
+        response = requests.get(url, timeout=10)
+        if response.status_code == 200:
+            data = response.json()
+            return float(data.get('dash', {}).get('usd', 0))
+    except:
+        pass
+    return 0.0
+
+def get_receipt_counter(user_id: int) -> int:
     with db() as conn:
-        return conn.execute("SELECT 1 FROM seen_transactions WHERE user_id = ? AND address = ? LIMIT 1", (user_id, address)).fetchone() is not None
+        row = conn.execute("SELECT counter FROM user_receipt_counter WHERE user_id = ?", (user_id,)).fetchone()
+        return row['counter'] if row else 0
+
+def increment_receipt_counter(user_id: int) -> int:
+    with db() as conn:
+        current = get_receipt_counter(user_id)
+        new_count = current + 1
+        conn.execute("INSERT OR REPLACE INTO user_receipt_counter(user_id, counter) VALUES (?, ?)", (user_id, new_count))
+        conn.commit()
+        return new_count
 
 # ===== TRANSLATIONS =====
 TRANSLATIONS = {
@@ -126,7 +152,7 @@ TRANSLATIONS = {
         "remove_success": "✅ Removed",
         "checking": "🔄 Scanning...",
         "scan_complete": "✅ Scan complete!\n💰 Found: {count} new deposit(s)",
-        "deposit_notification": "💰 **NEW DASH DEPOSIT!** 💰\n\n📥 **Address:** `{address}`\n💵 **Amount:** `{amount:.8f}` DASH\n🕒 **Time:** {time}\n🌐 [View]({explorer})",
+        "deposit_notification": "📬 **Receipt #{num}**\n\n💰 **NEW DASH DEPOSIT!** 💰\n\n📥 **Address:** `{address}`\n💵 **Amount:** `{amount:.8f}` DASH\n💵 **USD Value:** `${usd_value:.2f}`\n🕒 **Time:** {time}\n🌐 [View]({explorer})",
         "btn_add_address": "➕ Add Address",
         "btn_my_addresses": "📚 My Addresses",
         "btn_check_now": "🔄 Check Now",
@@ -145,7 +171,7 @@ TRANSLATIONS = {
         "remove_success": "✅ Հեռացված է",
         "checking": "🔄 Ստուգում...",
         "scan_complete": "✅ Ստուգումն ավարտվել է!\n💰 Գտնված՝ {count}",
-        "deposit_notification": "💰 **ՆՈՐ DASH ՄՈՒՏՔ!** 💰\n\n📥 **Հասցե՝** `{address}`\n💵 **Գումար՝** `{amount:.8f}` DASH\n🕒 **Ժամ՝** {time}",
+        "deposit_notification": "📬 **Չեք #{num}**\n\n💰 **ՆՈՐ DASH ՄՈՒՏՔ!** 💰\n\n📥 **Հասցե՝** `{address}`\n💵 **Գումար՝** `{amount:.8f}` DASH\n💵 **USD Արժեք՝** `${usd_value:.2f}`\n🕒 **Ժամ՝** {time}",
         "btn_add_address": "➕ Ավելացնել",
         "btn_my_addresses": "📚 Իմ հասցեներ",
         "btn_check_now": "🔄 Ստուգել",
@@ -284,13 +310,16 @@ async def panel_click(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     if data == "check_now":
         await query.edit_message_text(_(user_id, "checking"))
+        price = get_dash_price_usd()
         count = 0
         for row in get_addresses(user_id):
             deposits = check_address_for_deposits(user_id, row['address'])
             for d in deposits:
                 mark_tx_seen(user_id, d['txid'], row['address'])
+                receipt_num = increment_receipt_counter(user_id)
                 explorer = EXPLORER_TX_URL.format(txid=d['txid'])
-                msg = _(user_id, "deposit_notification", address=row['address'], amount=d['amount'], time=d['time_str'], explorer=explorer)
+                usd_value = d['amount'] * price if price > 0 else 0
+                msg = _(user_id, "deposit_notification", num=receipt_num, address=row['address'], amount=d['amount'], usd_value=usd_value, time=d['time_str'], explorer=explorer)
                 await context.bot.send_message(chat_id=user_id, text=msg, parse_mode='Markdown', disable_web_page_preview=True)
                 count += 1
             time.sleep(2)
@@ -335,15 +364,29 @@ async def cancel(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     return ConversationHandler.END
 
 async def periodic_check(context: ContextTypes.DEFAULT_TYPE):
+    price = get_dash_price_usd()
     for admin_id in ADMIN_CHAT_IDS:
         try:
             count = 0
             for row in get_addresses(admin_id):
+                # Seed old transactions on first scan
+                if not has_seen_transactions_for_address(admin_id, row['address']):
+                    logger.info(f"🛡 Seeding old txs for {row['address'][:16]}...")
+                    url = INSIGHT_ADDR_API.format(address=row['address'])
+                    data = fetch_json(url)
+                    if data:
+                        for txid in data.get('transactions', [])[:20]:
+                            mark_tx_seen(admin_id, txid, row['address'])
+                    time.sleep(1)
+                    continue
+                
                 deposits = check_address_for_deposits(admin_id, row['address'])
                 for d in deposits:
                     mark_tx_seen(admin_id, d['txid'], row['address'])
+                    receipt_num = increment_receipt_counter(admin_id)
                     explorer = EXPLORER_TX_URL.format(txid=d['txid'])
-                    msg = _(admin_id, "deposit_notification", address=row['address'], amount=d['amount'], time=d['time_str'], explorer=explorer)
+                    usd_value = d['amount'] * price if price > 0 else 0
+                    msg = _(admin_id, "deposit_notification", num=receipt_num, address=row['address'], amount=d['amount'], usd_value=usd_value, time=d['time_str'], explorer=explorer)
                     await context.bot.send_message(chat_id=admin_id, text=msg, parse_mode='Markdown', disable_web_page_preview=True)
                     count += 1
                 time.sleep(2)
