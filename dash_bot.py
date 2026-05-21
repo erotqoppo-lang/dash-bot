@@ -43,10 +43,6 @@ BLOCKCYPHER_TOKEN = os.environ.get("BLOCKCYPHER_TOKEN", "")
 BLOCKCYPHER_TOKEN_2 = os.environ.get("BLOCKCYPHER_TOKEN_2", "")
 BLOCKCYPHER_TOKEN_3 = os.environ.get("BLOCKCYPHER_TOKEN_3", "")
 
-BLOCKCYPHER_TOKEN = os.environ.get("BLOCKCYPHER_TOKEN", "")
-BLOCKCYPHER_TOKEN_2 = os.environ.get("BLOCKCYPHER_TOKEN_2", "")
-BLOCKCYPHER_TOKEN_3 = os.environ.get("BLOCKCYPHER_TOKEN_3", "")
-
 # Multiple blockchain API sources with automatic fallback
 BLOCKCHAIN_APIS = [
     {
