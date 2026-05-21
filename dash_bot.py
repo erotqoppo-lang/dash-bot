@@ -663,7 +663,17 @@ async def fetch_address_txs(session: aiohttp.ClientSession, address: str) -> lis
                     
                     try:
                         data = await resp.json()
-                        txs = data if isinstance(data, list) else []
+                        logger.debug(f"Insight raw response: {str(data)[:200]}")  # Debug
+                        
+                        # Handle both list and dict formats
+                        if isinstance(data, dict):
+                            txs = data.get("transactions", [])
+                        elif isinstance(data, list):
+                            txs = data
+                        else:
+                            txs = []
+                        
+                        logger.info(f"Insight returned {len(txs)} transactions")
                         
                         for tx in txs:
                             tx["_source"] = "Insight"
