@@ -664,6 +664,10 @@ async def fetch_address_txs(session: aiohttp.ClientSession, address: str) -> lis
                     if resp.status == 429:
                         logger.warning(f"Token #{token_num} rate limited (429)")
                         continue
+                    if resp.status == 404:
+                        logger.info(f"✓ BlockCypher: 0 txs (address not found)")
+                        _api_health.mark_success("BlockCypher")
+                        return []
                     if resp.status != 200:
                         _api_health.mark_fail("BlockCypher")
                         logger.warning(f"BlockCypher {resp.status}")
