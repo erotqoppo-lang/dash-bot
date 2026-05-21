@@ -46,18 +46,16 @@ BLOCKCYPHER_TOKEN_3 = os.environ.get("BLOCKCYPHER_TOKEN_3", "")
 # Multiple blockchain API sources with automatic fallback
 BLOCKCHAIN_APIS = [
     {
-        "name": "Chainz",
-        "base_url": "https://chainz.cryptoid.info/dash",
-        "parse_fn": "parse_chainz",
+        "name": "BlockCypher",
+        "base_url": "https://api.blockcypher.com/v1/dash/main",
+        "parse_fn": "parse_blockcypher",
         "enabled": True,
     },
 ]
 
-POLLING_INTERVAL = 120  # seconds between blockchain checks (increased from 45)
-
-POLLING_INTERVAL = 15  # seconds between blockchain checks (faster notifications)
+POLLING_INTERVAL = 60  # Check every 60 seconds
 PRICE_CACHE_TTL = 120  # seconds to cache DASH/USD price
-INCLUDE_UNCONFIRMED = True  # Include unconfirmed mempool transactions for faster alerts
+INCLUDE_UNCONFIRMED = True  # Show unconfirmed transactions immediately
 
 logging.basicConfig(
     format="%(asctime)s | %(levelname)-8s | %(name)s | %(message)s",
@@ -71,8 +69,22 @@ class APIHealthTracker:
     """Tracks API health and automatically switches to best performing API."""
     def __init__(self):
         self.api_stats: dict[str, dict] = {
-            "Chainz": {"success": 0, "fail": 0, "ratelimit": 0, "disabled_until": 0.0},
+            "BlockCypher": {"success": 0, "fail": 0, "ratelimit": 0},
         }
+        self.token_idx = 0
+    
+    def get_token(self) -> tuple[int, str]:
+        """Get next token in simple round-robin"""
+        tokens = [BLOCKCYPHER_TOKEN, BLOCKCYPHER_TOKEN_2, BLOCKCYPHER_TOKEN_3]
+        available = [t for t in tokens if t]
+        
+        if not available:
+            return -1, ""
+        
+        token = available[self.token_idx % len(available)]
+        token_num = tokens.index(token) + 1
+        self.token_idx += 1
+        return token_num, token
     
     def mark_success(self, api_name: str) -> None:
         if api_name in self.api_stats:
@@ -637,76 +649,43 @@ async def fetch_address_txs(session: aiohttp.ClientSession, address: str) -> lis
             continue
 
         try:
-            if api_name == "Chainz":
-                url = "https://chainz.cryptoid.info/dash/api.dws"
-                params = {"q": "addresstxs", "a": address, "limit": "50"}
-                async with session.get(url, params=params, timeout=aiohttp.ClientTimeout(total=15)) as resp:
+            if api_name == "BlockCypher":
+                token_num, token = _api_health.get_token()
+                
+                if token_num == -1 or not token:
+                    _api_health.mark_fail("BlockCypher")
+                    logger.warning("No tokens configured")
+                    continue
+                
+                token_param = f"&token={token}"
+                url = f"https://api.blockcypher.com/v1/dash/main/addrs/{address}/full{token_param}"
+                
+                async with session.get(url, timeout=aiohttp.ClientTimeout(total=15)) as resp:
                     if resp.status == 429:
-                        _api_health.mark_ratelimit("Chainz")
-                        logger.warning("Chainz rate limited")
+                        logger.warning(f"Token #{token_num} rate limited (429)")
                         continue
                     if resp.status != 200:
-                        _api_health.mark_fail("Chainz")
-                        logger.warning(f"Chainz {resp.status}")
+                        _api_health.mark_fail("BlockCypher")
+                        logger.warning(f"BlockCypher {resp.status}")
                         continue
                     
-                    try:
-                        data = await resp.json()
-                        if isinstance(data, dict) and "error" in data:
-                            _api_health.mark_fail("Chainz")
-                            continue
-                        
-                        if not isinstance(data, list):
-                            logger.info(f"✓ Chainz: 0 txs")
-                            _api_health.mark_success("Chainz")
-                            return []
-                        
-                        # Convert Chainz format
-                        converted = []
-                        for tx in data:
-                            if not isinstance(tx, dict) or "txid" not in tx:
-                                continue
-                            
-                            normalized = {
-                                "hash": tx.get("txid"),
-                                "time": tx.get("time"),
-                                "received": tx.get("time"),
-                                "confirmations": tx.get("confirmations", 0),
-                                "inputs": [],
-                                "outputs": [],
-                                "_source": "Chainz",
-                            }
-                            
-                            for vin in tx.get("vin", []):
-                                if isinstance(vin, dict) and "addr" in vin:
-                                    normalized["inputs"].append({"addresses": [vin["addr"]]})
-                            
-                            for vout in tx.get("vout", []):
-                                if isinstance(vout, dict):
-                                    addresses = []
-                                    if "addresses" in vout and isinstance(vout["addresses"], list):
-                                        addresses = vout["addresses"]
-                                    normalized["outputs"].append({"addresses": addresses, "value": vout.get("value", 0)})
-                            
-                            if normalized["hash"]:
-                                converted.append(normalized)
-                        
-                        _api_health.mark_success("Chainz")
-                        logger.info(f"✓ Chainz: {len(converted)} txs")
-                        return converted
-                    
-                    except Exception as e:
-                        _api_health.mark_fail("Chainz")
-                        logger.warning(f"Chainz error: {e}")
-                        continue
+                    data = await resp.json()
+                    txs = data.get("txs", [])
+                
+                for tx in txs:
+                    tx["_source"] = "BlockCypher"
+                
+                _api_health.mark_success("BlockCypher")
+                logger.info(f"✓ BlockCypher: {len(txs)} txs (token #{token_num})")
+                return txs
 
         except asyncio.TimeoutError:
-            _api_health.mark_fail("Chainz")
-            logger.warning(f"Chainz timeout")
+            _api_health.mark_fail("BlockCypher")
+            logger.warning("BlockCypher timeout")
             continue
         except Exception as exc:
-            _api_health.mark_fail("Chainz")
-            logger.error(f"Chainz error: {exc}")
+            _api_health.mark_fail("BlockCypher")
+            logger.error(f"BlockCypher error: {exc}")
             continue
 
     logger.error(f"⚠ All APIs failed for {address[:16]}...")
