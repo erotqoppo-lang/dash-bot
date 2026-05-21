@@ -46,9 +46,9 @@ BLOCKCYPHER_TOKEN_3 = os.environ.get("BLOCKCYPHER_TOKEN_3", "")
 # Multiple blockchain API sources with automatic fallback
 BLOCKCHAIN_APIS = [
     {
-        "name": "Insight",
-        "base_url": "https://insight.dash.org/insight-api",
-        "parse_fn": "parse_insight",
+        "name": "BlockCypher",
+        "base_url": "https://api.blockcypher.com/v1/dash/main",
+        "parse_fn": "parse_blockcypher",
         "enabled": True,
     },
 ]
@@ -69,7 +69,7 @@ class APIHealthTracker:
     """Tracks API health and automatically switches to best performing API."""
     def __init__(self):
         self.api_stats: dict[str, dict] = {
-            "Insight": {"success": 0, "fail": 0, "ratelimit": 0, "disabled_until": 0.0},
+            "BlockCypher": {"success": 0, "fail": 0, "ratelimit": 0, "disabled_until": 0.0},
         }
         self.token_idx = 0
     
@@ -649,50 +649,47 @@ async def fetch_address_txs(session: aiohttp.ClientSession, address: str) -> lis
             continue
 
         try:
-            if api_name == "Insight":
-                url = f"https://insight.dash.org/insight-api/addrs/{address}/txs"
+            if api_name == "BlockCypher":
+                token_num, token = _api_health.get_token()
+                
+                if token_num == -1 or not token:
+                    _api_health.mark_fail("BlockCypher")
+                    logger.warning("No tokens configured")
+                    continue
+                
+                token_param = f"&token={token}"
+                url = f"https://api.blockcypher.com/v1/dash/main/addrs/{address}/full{token_param}"
+                
                 async with session.get(url, timeout=aiohttp.ClientTimeout(total=15)) as resp:
                     if resp.status == 429:
-                        _api_health.mark_ratelimit("Insight")
-                        logger.warning("Insight rate limited")
+                        logger.warning(f"Token #{token_num} rate limited (429)")
+                        continue
+                    if resp.status == 404:
+                        # Address not found - try next token
+                        logger.debug(f"Token #{token_num}: Address not found (404)")
                         continue
                     if resp.status != 200:
-                        _api_health.mark_fail("Insight")
-                        logger.warning(f"Insight {resp.status}")
+                        _api_health.mark_fail("BlockCypher")
+                        logger.warning(f"BlockCypher {resp.status}")
                         continue
                     
-                    try:
-                        data = await resp.json()
-                        logger.debug(f"Insight raw response: {str(data)[:200]}")  # Debug
-                        
-                        # Handle both list and dict formats
-                        if isinstance(data, dict):
-                            txs = data.get("transactions", [])
-                        elif isinstance(data, list):
-                            txs = data
-                        else:
-                            txs = []
-                        
-                        logger.info(f"Insight returned {len(txs)} transactions")
-                        
-                        for tx in txs:
-                            tx["_source"] = "Insight"
-                        
-                        _api_health.mark_success("Insight")
-                        logger.info(f"✓ Insight: {len(txs)} txs")
-                        return txs
-                    except Exception as e:
-                        _api_health.mark_fail("Insight")
-                        logger.warning(f"Insight error: {e}")
-                        continue
+                    data = await resp.json()
+                    txs = data.get("txs", [])
+                
+                for tx in txs:
+                    tx["_source"] = "BlockCypher"
+                
+                _api_health.mark_success("BlockCypher")
+                logger.info(f"✓ BlockCypher: {len(txs)} txs (token #{token_num})")
+                return txs
 
         except asyncio.TimeoutError:
-            _api_health.mark_fail("Insight")
-            logger.warning("Insight timeout")
+            _api_health.mark_fail("BlockCypher")
+            logger.warning("BlockCypher timeout")
             continue
         except Exception as exc:
-            _api_health.mark_fail("Insight")
-            logger.error(f"Insight error: {exc}")
+            _api_health.mark_fail("BlockCypher")
+            logger.error(f"BlockCypher error: {exc}")
             continue
 
     logger.error(f"⚠ All APIs failed for {address[:16]}...")
