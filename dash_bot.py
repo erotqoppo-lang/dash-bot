@@ -115,6 +115,10 @@ def mark_tx_seen(user_id: int, txid: str, address: str):
         conn.execute("INSERT OR IGNORE INTO seen_transactions(user_id, txid, address) VALUES (?, ?, ?)", (user_id, txid, address))
         conn.commit()
 
+def has_seen_transactions_for_address(user_id: int, address: str) -> bool:
+    with db() as conn:
+        return conn.execute("SELECT 1 FROM seen_transactions WHERE user_id = ? AND address = ? LIMIT 1", (user_id, address)).fetchone() is not None
+
 def get_dash_price_usd() -> float:
     try:
         url = "https://api.coingecko.com/api/v3/simple/price?ids=dash&vs_currencies=usd"
