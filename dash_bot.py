@@ -156,7 +156,7 @@ TRANSLATIONS = {
         "remove_success": "✅ Removed",
         "checking": "🔄 Scanning...",
         "scan_complete": "✅ Scan complete!\n💰 Found: {count} new deposit(s)",
-        "deposit_notification": "📬 **Receipt #{num}**\n\n💰 **NEW DASH DEPOSIT!** 💰\n\n📥 **Address:** `{address}`\n💵 **Amount:** `{amount:.8f}` DASH\n💵 **USD Value:** `${usd_value:.2f}`\n🕒 **Time:** {time}\n🌐 [View]({explorer})",
+        "deposit_notification": "📬 **Receipt #{num}**\n\n💰 **NEW DASH DEPOSIT!** 💰\n\n📥 **To Address:** `{address}`\n💸 **From:** `{senders}`\n💵 **Amount:** `{amount:.8f}` DASH\n💵 **USD Value:** `${usd_value:.2f}`\n🕒 **Time:** {time}\n🔗 **TXID:** [View Transaction]({explorer})",
         "btn_add_address": "➕ Add Address",
         "btn_my_addresses": "📚 My Addresses",
         "btn_check_now": "🔄 Check Now",
@@ -250,6 +250,15 @@ def check_address_for_deposits(user_id: int, address: str) -> List[dict]:
                     received_value += float(value)
 
         if received_value > 0:
+            # Get sender addresses from inputs
+            senders = []
+            for vin in tx_data.get('vin', []):
+                addr = vin.get('addr')
+                if addr and addr != address:
+                    senders.append(addr[:16] + "...")
+            
+            senders_str = ", ".join(senders) if senders else "Unknown"
+            
             tx_time = tx_data.get('time', 0)
             if tx_time:
                 dt = datetime.fromtimestamp(tx_time, tz=timezone.utc)
@@ -258,7 +267,7 @@ def check_address_for_deposits(user_id: int, address: str) -> List[dict]:
             else:
                 time_str = "Just now"
             
-            deposits.append({'txid': txid, 'amount': received_value, 'time_str': time_str})
+            deposits.append({'txid': txid, 'amount': received_value, 'time_str': time_str, 'senders': senders_str})
             logger.info(f"💰 Found: {received_value:.8f} DASH to {address[:16]}...")
         else:
             mark_tx_seen(user_id, txid, address)
@@ -323,7 +332,7 @@ async def panel_click(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 receipt_num = increment_receipt_counter(user_id)
                 explorer = EXPLORER_TX_URL.format(txid=d['txid'])
                 usd_value = d['amount'] * price if price > 0 else 0
-                msg = _(user_id, "deposit_notification", num=receipt_num, address=row['address'], amount=d['amount'], usd_value=usd_value, time=d['time_str'], explorer=explorer)
+                msg = _(user_id, "deposit_notification", num=receipt_num, address=row['address'], amount=d['amount'], usd_value=usd_value, time=d['time_str'], senders=d['senders'], explorer=explorer)
                 await context.bot.send_message(chat_id=user_id, text=msg, parse_mode='Markdown', disable_web_page_preview=True)
                 count += 1
             time.sleep(2)
@@ -390,7 +399,7 @@ async def periodic_check(context: ContextTypes.DEFAULT_TYPE):
                     receipt_num = increment_receipt_counter(admin_id)
                     explorer = EXPLORER_TX_URL.format(txid=d['txid'])
                     usd_value = d['amount'] * price if price > 0 else 0
-                    msg = _(admin_id, "deposit_notification", num=receipt_num, address=row['address'], amount=d['amount'], usd_value=usd_value, time=d['time_str'], explorer=explorer)
+                    msg = _(admin_id, "deposit_notification", num=receipt_num, address=row['address'], amount=d['amount'], usd_value=usd_value, time=d['time_str'], senders=d['senders'], explorer=explorer)
                     await context.bot.send_message(chat_id=admin_id, text=msg, parse_mode='Markdown', disable_web_page_preview=True)
                     count += 1
                 time.sleep(2)
