@@ -125,9 +125,11 @@ def get_dash_price_usd() -> float:
         response = requests.get(url, timeout=10)
         if response.status_code == 200:
             data = response.json()
-            return float(data.get('dash', {}).get('usd', 0))
-    except:
-        pass
+            price = float(data.get('dash', {}).get('usd', 0))
+            logger.info(f"💰 DASH/USD: ${price}")
+            return price
+    except Exception as e:
+        logger.warning(f"Price fetch error: {e}")
     return 0.0
 
 def get_receipt_counter(user_id: int) -> int:
@@ -156,7 +158,7 @@ TRANSLATIONS = {
         "remove_success": "✅ Removed",
         "checking": "🔄 Scanning...",
         "scan_complete": "✅ Scan complete!\n💰 Found: {count} new deposit(s)",
-        "deposit_notification": "📬 **Receipt #{num}**\n\n💰 **NEW DASH DEPOSIT!** 💰\n\n📥 **To Address:** `{address}`\n💸 **From:** `{senders}`\n💵 **Amount:** `{amount:.8f}` DASH\n💵 **USD Value:** `${usd_value:.2f}`\n🕒 **Time:** {time}\n🔗 **TXID:** [View Transaction]({explorer})",
+        "deposit_notification": "📬 **Receipt #{num}**\n\n💰 **NEW DASH DEPOSIT!** 💰\n\n📥 **To:** `{address}`\n💸 **From:** `{senders}`\n💵 **Amount:** `{amount:.8f}` DASH\n💵 **USD:** `${usd_value:.2f}`\n🕒 **Time:** {time}\n🔗 **[View TX]({explorer})**",
         "btn_add_address": "➕ Add Address",
         "btn_my_addresses": "📚 My Addresses",
         "btn_check_now": "🔄 Check Now",
@@ -175,7 +177,7 @@ TRANSLATIONS = {
         "remove_success": "✅ Հեռացված է",
         "checking": "🔄 Ստուգում...",
         "scan_complete": "✅ Ստուգումն ավարտվել է!\n💰 Գտնված՝ {count}",
-        "deposit_notification": "📬 **Չեք #{num}**\n\n💰 **ՆՈՐ DASH ՄՈՒՏՔ!** 💰\n\n📥 **Հասցե՝** `{address}`\n💵 **Գումար՝** `{amount:.8f}` DASH\n💵 **USD Արժեք՝** `${usd_value:.2f}`\n🕒 **Ժամ՝** {time}",
+        "deposit_notification": "📬 **Չեք #{num}**\n\n💰 **ՆՈՐ DASH ՄՈՒՏՔ!** 💰\n\n📥 **Հասցե՝** `{address}`\n💸 **Ից՝** `{senders}`\n💵 **Գումար՝** `{amount:.8f}` DASH\n💵 **USD՝** `${usd_value:.2f}`\n🕒 **Ժամ՝** {time}\n🔗 **[Տեսնել TX]({explorer})**",
         "btn_add_address": "➕ Ավելացնել",
         "btn_my_addresses": "📚 Իմ հասցեներ",
         "btn_check_now": "🔄 Ստուգել",
@@ -382,16 +384,16 @@ async def periodic_check(context: ContextTypes.DEFAULT_TYPE):
         try:
             count = 0
             for row in get_addresses(admin_id):
-                # Seed old transactions on first scan
+                # Seed old transactions on first scan - mark ALL as seen
                 if not has_seen_transactions_for_address(admin_id, row['address']):
                     logger.info(f"🛡 Seeding old txs for {row['address'][:16]}...")
                     url = INSIGHT_ADDR_API.format(address=row['address'])
                     data = fetch_json(url)
                     if data:
-                        for txid in data.get('transactions', [])[:20]:
+                        for txid in data.get('transactions', [])[:50]:  # Mark first 50 as seen
                             mark_tx_seen(admin_id, txid, row['address'])
-                    time.sleep(1)
-                    continue
+                        logger.info(f"✅ Marked {len(data.get('transactions', [])[:50])} old txs as seen")
+                    continue  # Skip to next address
                 
                 deposits = check_address_for_deposits(admin_id, row['address'])
                 for d in deposits:
