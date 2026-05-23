@@ -177,7 +177,7 @@ TRANSLATIONS = {
         "remove_success": "✅ Հեռացված է",
         "checking": "🔄 Ստուգում...",
         "scan_complete": "✅ Ստուգումն ավարտվել է!\n💰 Գտնված՝ {count}",
-        "deposit_notification": "📬 **Չեք #{num}**\n\n💰 **ՆՈՐ DASH ՄՈՒՏՔ!** 💰\n\n📥 **Հասցե՝** `{address}`\n💸 **Ից՝** `{senders}`\n💵 **Գումար՝** `{amount:.8f}` DASH\n💵 **USD՝** `${usd_value:.2f}`\n🕒 **Ժամ՝** {time}\n🔗 **[Տեսնել TX]({explorer})**",
+        "deposit_notification": "📬 **Չեք #{num}**\n\n💰 **ՆՈՐ DASH ՄՈՒՏՔ!** 💰\n\n📥 **Հասցե՝** `{address}`\n💸 **Ուղարկողից՝** `{senders}`\n💵 **Գումար՝** `{amount:.8f}` DASH\n💵 **USD՝** `${usd_value:.2f}`\n🕒 **Ժամ՝** {time}\n🔗 **[Տեսնել TX]({explorer})**",
         "btn_add_address": "➕ Ավելացնել",
         "btn_my_addresses": "📚 Իմ հասցեներ",
         "btn_check_now": "🔄 Ստուգել",
@@ -257,7 +257,7 @@ def check_address_for_deposits(user_id: int, address: str) -> List[dict]:
             for vin in tx_data.get('vin', []):
                 addr = vin.get('addr')
                 if addr and addr != address:
-                    senders.append(addr[:16] + "...")
+                    senders.append(addr)  # Full address, not truncated
             
             senders_str = ", ".join(senders) if senders else "Unknown"
             
