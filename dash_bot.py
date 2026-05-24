@@ -22,7 +22,7 @@ from telegram.ext import (
 BOT_TOKEN = os.getenv("BOT_TOKEN", "")
 ADMIN_CHAT_IDS = [int(x.strip()) for x in os.getenv("ADMIN_CHAT_IDS", "").split(",") if x.strip().isdigit()]
 DB_PATH = "dash_watch.db"
-CHECK_INTERVAL_SECONDS = 60
+CHECK_INTERVAL_SECONDS = 45
 TZ_OFFSET_HOURS = 4
 
 # Insight API
@@ -158,7 +158,7 @@ TRANSLATIONS = {
         "remove_success": "✅ Removed",
         "checking": "🔄 Scanning...",
         "scan_complete": "✅ Scan complete!\n💰 Found: {count} new deposit(s)",
-        "deposit_notification": "📬 **Receipt #{num}**\n\n💰 **NEW DASH DEPOSIT!** 💰\n\n📥 **To:** `{address}`\n💸 **From:** `{senders}`\n💵 **Amount:** `{amount:.8f}` DASH\n💵 **USD:** `${usd_value:.2f}`\n🕒 **Time:** {time}\n🔗 **[View TX]({explorer})**",
+        "deposit_notification": "📬 **Receipt #{num}**\n\n💰 **NEW DASH DEPOSIT!** 💰\n\n📥 **To:** {address}\n\n💸 **From:** {senders}\n\n💵 **Amount:** {amount:.8f} DASH\n\n💵 **USD:** ${usd_value:.2f}\n\n🕒 **Time:** {time}\n\n🔗 **TXID:** {txid}",
         "btn_add_address": "➕ Add Address",
         "btn_my_addresses": "📚 My Addresses",
         "btn_check_now": "🔄 Check Now",
@@ -177,7 +177,7 @@ TRANSLATIONS = {
         "remove_success": "✅ Հեռացված է",
         "checking": "🔄 Ստուգում...",
         "scan_complete": "✅ Ստուգումն ավարտվել է!\n💰 Գտնված՝ {count}",
-        "deposit_notification": "📬 **Չեք #{num}**\n\n💰 **ՆՈՐ DASH ՄՈՒՏՔ!** 💰\n\n📥 **Հասցե՝** `{address}`\n💸 **Ուղարկողից՝** `{senders}`\n💵 **Գումար՝** `{amount:.8f}` DASH\n💵 **USD՝** `${usd_value:.2f}`\n🕒 **Ժամ՝** {time}\n🔗 **[Տեսնել TX]({explorer})**",
+        "deposit_notification": "📬 **Չեք #{num}**\n\n💰 **ՆՈՐ DASH ՄՈՒՏՔ!** 💰\n\n📥 **Հասցե՝** {address}\n\n💸 **Ուղարկողից՝** {senders}\n\n💵 **Գումար՝** {amount:.8f} DASH\n\n💵 **USD՝** ${usd_value:.2f}\n\n🕒 **Ժամ՝** {time}\n\n🔗 **TXID՝** {txid}",
         "btn_add_address": "➕ Ավելացնել",
         "btn_my_addresses": "📚 Իմ հասցեներ",
         "btn_check_now": "🔄 Ստուգել",
@@ -332,9 +332,8 @@ async def panel_click(update: Update, context: ContextTypes.DEFAULT_TYPE):
             for d in deposits:
                 mark_tx_seen(user_id, d['txid'], row['address'])
                 receipt_num = increment_receipt_counter(user_id)
-                explorer = EXPLORER_TX_URL.format(txid=d['txid'])
                 usd_value = d['amount'] * price if price > 0 else 0
-                msg = _(user_id, "deposit_notification", num=receipt_num, address=row['address'], amount=d['amount'], usd_value=usd_value, time=d['time_str'], senders=d['senders'], explorer=explorer)
+                msg = _(user_id, "deposit_notification", num=receipt_num, address=row['address'], amount=d['amount'], usd_value=usd_value, time=d['time_str'], senders=d['senders'], txid=d['txid'])
                 await context.bot.send_message(chat_id=user_id, text=msg, parse_mode='Markdown', disable_web_page_preview=True)
                 count += 1
             time.sleep(2)
@@ -399,9 +398,8 @@ async def periodic_check(context: ContextTypes.DEFAULT_TYPE):
                 for d in deposits:
                     mark_tx_seen(admin_id, d['txid'], row['address'])
                     receipt_num = increment_receipt_counter(admin_id)
-                    explorer = EXPLORER_TX_URL.format(txid=d['txid'])
                     usd_value = d['amount'] * price if price > 0 else 0
-                    msg = _(admin_id, "deposit_notification", num=receipt_num, address=row['address'], amount=d['amount'], usd_value=usd_value, time=d['time_str'], senders=d['senders'], explorer=explorer)
+                    msg = _(admin_id, "deposit_notification", num=receipt_num, address=row['address'], amount=d['amount'], usd_value=usd_value, time=d['time_str'], senders=d['senders'], txid=d['txid'])
                     await context.bot.send_message(chat_id=admin_id, text=msg, parse_mode='Markdown', disable_web_page_preview=True)
                     count += 1
                 time.sleep(2)
