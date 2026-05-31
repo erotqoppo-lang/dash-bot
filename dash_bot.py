@@ -22,7 +22,7 @@ from telegram.ext import (
 BOT_TOKEN = os.getenv("BOT_TOKEN", "")
 ADMIN_CHAT_IDS = [int(x.strip()) for x in os.getenv("ADMIN_CHAT_IDS", "").split(",") if x.strip().isdigit()]
 DB_PATH = "dash_watch.db"
-CHECK_INTERVAL_SECONDS = 45
+CHECK_INTERVAL_SECONDS = 20
 TZ_OFFSET_HOURS = 4
 
 # Insight API
