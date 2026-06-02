@@ -35,6 +35,10 @@ logger = logging.getLogger(__name__)
 
 ADD_ADDRESS = 1
 
+# Price cache
+_price_cache = {"price": 0.0, "time": 0}
+PRICE_CACHE_TTL = 300  # Cache for 5 minutes
+
 # ===== DATABASE =====
 def db():
     conn = sqlite3.connect(DB_PATH)
@@ -120,17 +124,28 @@ def has_seen_transactions_for_address(user_id: int, address: str) -> bool:
         return conn.execute("SELECT 1 FROM seen_transactions WHERE user_id = ? AND address = ? LIMIT 1", (user_id, address)).fetchone() is not None
 
 def get_dash_price_usd() -> float:
+    global _price_cache
+    now = time.time()
+    
+    # Return cached price if still valid
+    if _price_cache["price"] > 0 and (now - _price_cache["time"]) < PRICE_CACHE_TTL:
+        return _price_cache["price"]
+    
     try:
         url = "https://api.coingecko.com/api/v3/simple/price?ids=dash&vs_currencies=usd"
         response = requests.get(url, timeout=10)
         if response.status_code == 200:
             data = response.json()
             price = float(data.get('dash', {}).get('usd', 0))
-            logger.info(f"💰 DASH/USD: ${price}")
-            return price
+            if price > 0:
+                _price_cache = {"price": price, "time": now}
+                logger.info(f"💰 DASH/USD: ${price}")
+                return price
     except Exception as e:
         logger.warning(f"Price fetch error: {e}")
-    return 0.0
+    
+    # Return last cached price if available
+    return _price_cache.get("price", 0.0)
 
 def get_receipt_counter(user_id: int) -> int:
     with db() as conn:
