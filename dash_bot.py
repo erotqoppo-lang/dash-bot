@@ -22,7 +22,7 @@ from telegram.ext import (
 BOT_TOKEN = os.getenv("BOT_TOKEN", "")
 ADMIN_CHAT_IDS = [int(x.strip()) for x in os.getenv("ADMIN_CHAT_IDS", "").split(",") if x.strip().isdigit()]
 DB_PATH = "dash_watch.db"
-CHECK_INTERVAL_SECONDS = 25
+CHECK_INTERVAL_SECONDS = 20
 TZ_OFFSET_HOURS = 4
 
 # Insight API
@@ -127,24 +127,37 @@ def get_dash_price_usd() -> float:
     global _price_cache
     now = time.time()
     
-    # Return cached price if still valid
     if _price_cache["price"] > 0 and (now - _price_cache["time"]) < PRICE_CACHE_TTL:
         return _price_cache["price"]
     
-    try:
-        url = "https://api.coingecko.com/api/v3/simple/price?ids=dash&vs_currencies=usd"
-        response = requests.get(url, timeout=10)
-        if response.status_code == 200:
-            data = response.json()
-            price = float(data.get('dash', {}).get('usd', 0))
-            if price > 0:
-                _price_cache = {"price": price, "time": now}
-                logger.info(f"💰 DASH/USD: ${price}")
-                return price
-    except Exception as e:
-        logger.warning(f"Price fetch error: {e}")
+    # Try multiple price APIs
+    apis = [
+        "https://api.binance.com/api/v3/ticker/price?symbol=DASHUSDT",
+        "https://api.coingecko.com/api/v3/simple/price?ids=dash&vs_currencies=usd",
+    ]
     
-    # Return last cached price if available
+    for api_url in apis:
+        try:
+            response = requests.get(api_url, timeout=10)
+            if response.status_code == 200:
+                data = response.json()
+                # Binance format
+                if "price" in data:
+                    price = float(data["price"])
+                # CoinGecko format
+                elif "dash" in data:
+                    price = float(data["dash"]["usd"])
+                else:
+                    continue
+                
+                if price > 0:
+                    _price_cache = {"price": price, "time": now}
+                    logger.info(f"💰 DASH/USD: ${price}")
+                    return price
+        except Exception as e:
+            logger.warning(f"Price API error: {e}")
+            continue
+    
     return _price_cache.get("price", 0.0)
 
 def get_receipt_counter(user_id: int) -> int:
